@@ -204,7 +204,10 @@ RUST_LOG=debug ./corplink-rs config.json
   // "0.0.0.0/0" (full-tunnel). useful for keeping local LAN traffic off the
   // VPN, and for excluding the VPN peer endpoint IP to avoid a routing loop
   // that would otherwise black-hole all traffic.
-  "vpn_disallowed_routes": ["192.168.1.0/24"]
+  "vpn_disallowed_routes": ["192.168.1.0/24"],
+  // optional: extra CIDRs to inject into AllowedIPs / system routes, on top
+  // of what the server returned. mirror of vpn_disallowed_routes.
+  "vpn_extra_routes": ["1.2.3.0/24", "5.6.7.8/32"]
 }
 ```
 

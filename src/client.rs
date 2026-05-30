@@ -860,6 +860,20 @@ impl Client {
             }
         };
 
+        // Inject extra CIDRs before disallow / peer-carve, so those still win on conflict.
+        if let Some(extra) = self.conf.vpn_extra_routes.as_ref() {
+            if !extra.is_empty() {
+                let before = allowed_ips.len();
+                allowed_ips.extend(extra.iter().cloned());
+                log::info!(
+                    "vpn_extra_routes applied: {} -> {} entries (added: {:?})",
+                    before,
+                    allowed_ips.len(),
+                    extra
+                );
+            }
+        }
+
         // Carve user-specified CIDRs out of allowed_ips. This removes any IPs in
         // vpn_disallowed_routes from the VPN's AllowedIPs (and the system routes
         // derived from them), which is the standard way to avoid routing loops in
