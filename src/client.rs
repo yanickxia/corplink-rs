@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::Utc;
 use cookie::Cookie as RawCookie;
 use cookie_store::{Cookie, CookieStore};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -26,11 +27,20 @@ use crate::config::{
 };
 use crate::qrcode::TerminalQrCode;
 use crate::resp::*;
+use crate::sign;
 use crate::state::State;
 use crate::totp::{totp_offset, TIME_STEP};
 use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
+const SIGN_RETRY_CODES: [i32; 2] = [11020001, 11020002];
+
+fn cookie_value<'a>(cookie_header: &'a str, expected_name: &str) -> Option<&'a str> {
+    cookie_header
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| (name == expected_name).then_some(value))
+}
 
 fn merge_additional_routes(
     mut routes: Vec<String>,
@@ -208,8 +218,6 @@ impl Client {
             log::info!("some cookies are expired");
         }
 
-        let mut headers = header::HeaderMap::new();
-
         if let Some(server) = conf.server.as_ref() {
             let server_url = Url::from_str(server.as_str())
                 .with_context(|| format!("invalid server url: {server}"))?;
@@ -224,26 +232,16 @@ impl Client {
                     .insert_raw(&RawCookie::new("device_name", device_name), &server_url)
                     .context("failed to insert device_name cookie")?;
             }
-
-            if let Some(domain) = server_url.domain().or_else(|| server_url.host_str()) {
-                if let Some(csrf_token) = cookie_store.get(domain, "/", "csrf-token") {
-                    let value = header::HeaderValue::from_str(csrf_token.value())
-                        .context("invalid csrf-token header value")?;
-                    headers.insert("csrf-token", value);
-                }
-            }
         }
 
         let cookie_store = Arc::new(CookieStoreMutex::new(cookie_store));
 
         // Keep probe responses out of the shared cookie store until an endpoint is selected.
         let probe_client = corplink_client_builder()
-            .default_headers(headers.clone())
             .build()
             .context("build VPN probe HTTP client")?;
         let c = corplink_client_builder()
             .cookie_provider(Arc::clone(&cookie_store))
-            .default_headers(headers)
             .build()
             .context("build http client")?;
         let conf_bak = conf.clone();
@@ -290,78 +288,130 @@ impl Client {
         api: ApiName,
         body: Option<Map<String, Value>>,
     ) -> Result<Resp<T>> {
-        let url = self.api_url.get_api_url(&api);
-
-        let rb = match body {
-            Some(body) => {
-                let body = serde_json::to_string(&body)
-                    .with_context(|| format!("failed to serialize request body for {api:?}"))?;
-                self.c
-                    .post(url)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(body)
-            }
-            None => self.c.get(url),
-        };
-
-        let resp = rb
-            .send()
-            .await
-            .with_context(|| format!("request {api:?} failed"))?;
-
-        if !resp.status().is_success() {
-            let msg = format!("logout because of bad resp code: {}", resp.status());
-            self.handle_logout_err(msg).await?;
-        }
-
-        self.parse_time_offset_from_date_header(&resp);
-
-        for (name, _) in resp.headers() {
-            if name.as_str().eq_ignore_ascii_case("set-cookie") {
-                log::info!("found set-cookie in header, saving cookie");
-                self.save_cookie()?;
-                break;
-            }
-        }
-        let text = resp
-            .text()
-            .await
-            .with_context(|| format!("failed to read response body for api {api:?}"))?;
-        // Parse the envelope generically first. When the server-side session has
-        // expired the server returns a non-zero code (e.g. 101) with a `data`
-        // whose shape doesn't match T (ListVPN, for instance, gets an object where
-        // it expects an array). Deserializing straight into Resp<T> would fail here
-        // and bypass the code-based logout/retry handling, leaving a stale-session
-        // run dead with a confusing parse error. So only coerce `data` into T once
-        // we know code == 0; otherwise keep the code/message so callers can react.
-        let raw: Resp<Value> = serde_json::from_str(&text).with_context(|| {
-            format!("failed to parse response envelope for api {api:?}: {text}")
-        })?;
-        let data = match (raw.code, raw.data) {
-            (0, Some(v)) => Some(
-                serde_json::from_value::<T>(v)
-                    .with_context(|| format!("failed to parse response data for api {api:?}"))?,
+        // body 不随重试变化：只序列化一次；body_bytes 借用 body_string，
+        // 在整个函数生命周期内保持不变，循环内直接复用。
+        let body_string: Option<String> = match &body {
+            Some(b) => Some(
+                serde_json::to_string(b)
+                    .with_context(|| format!("failed to serialize request body for {api:?}"))?,
             ),
-            _ => None,
+            None => None,
         };
-        let resp = Resp::<T> {
-            code: raw.code,
-            message: raw.message,
-            data,
-            action: raw.action,
-        };
-        log::debug!("api {:#?} resp: {:#?}", api, resp);
-        Ok(resp)
+        let body_bytes: &[u8] = body_string.as_deref().map(|s| s.as_bytes()).unwrap_or(b"");
+        let method = if body_string.is_some() { "POST" } else { "GET" };
+
+        for attempt in 0..2 {
+            // 每轮重新构造 url，使重试自动用刷新后的 timestamp。
+            let url_str = self.api_url.get_api_url(&api);
+            let mut url = Url::from_str(&url_str)
+                .with_context(|| format!("invalid api url {url_str} for {api:?}"))?;
+
+            // 签名端点需要 timestamp（秒），在签名前冻结进 query。
+            if sign::sign_mask_by_path(url.path()).is_some() {
+                let ts = self.current_timestamp().to_string();
+                // 用 query_pairs_mut 追加，保持既有参数在前、timestamp 在后；
+                // 之后签名与发送都用这个 url，保证逐字节一致。
+                url.query_pairs_mut().append_pair("timestamp", &ts);
+            }
+
+            // 同一轮内冻结 Cookie/CSRF：签名值与实际请求头必须使用同一份 token。
+            let cookie_str = self.cookie_header_for(&url)?;
+            let csrf = cookie_value(&cookie_str, "csrf-token")
+                .unwrap_or("")
+                .to_owned();
+            let sign_header =
+                self.build_sign_header_with_cookie(method, &url, body_bytes, &cookie_str, &csrf)?;
+
+            let mut rb = match &body_string {
+                Some(b) => self
+                    .c
+                    .post(url.clone())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(b.clone()),
+                None => self.c.get(url.clone()),
+            };
+
+            if !csrf.is_empty() {
+                rb = rb.header("csrf-token", &csrf);
+            }
+            if !cookie_str.is_empty() {
+                rb = rb.header(header::COOKIE, &cookie_str);
+            }
+            if let Some((name, value)) = sign_header {
+                log::debug!("signing {api:?} path={}", url.path());
+                rb = rb.header(name, value);
+            }
+
+            let resp = rb
+                .send()
+                .await
+                .with_context(|| format!("request {api:?} failed"))?;
+
+            if !resp.status().is_success() {
+                let msg = format!("logout because of bad resp code: {}", resp.status());
+                self.handle_logout_err(msg).await?;
+            }
+
+            // 每轮 send 后刷新 offset，使下一轮重试用到最新时间偏移。
+            self.parse_time_offset_from_date_header(&resp);
+
+            for (name, _) in resp.headers() {
+                if name.as_str().eq_ignore_ascii_case("set-cookie") {
+                    log::info!("found set-cookie in header, saving cookie");
+                    self.save_cookie()?;
+                    break;
+                }
+            }
+            let text = resp
+                .text()
+                .await
+                .with_context(|| format!("failed to read response body for api {api:?}"))?;
+            // 先解析通用 envelope，避免错误响应的 data 结构与 T 不一致时
+            // 在调用方看到业务错误码之前就反序列化失败。
+            let raw: Resp<Value> = serde_json::from_str(&text).with_context(|| {
+                format!("failed to parse response envelope for api {api:?}: {text}")
+            })?;
+
+            // 签名时间戳过期错误：刷新后重试一次
+            if attempt == 0 && SIGN_RETRY_CODES.contains(&raw.code) {
+                log::warn!("sign timestamp rejected (code {}), retrying once", raw.code);
+                continue;
+            }
+
+            let data = match (raw.code, raw.data) {
+                (0, Some(v)) => Some(
+                    serde_json::from_value::<T>(v)
+                        .with_context(|| format!("failed to parse response data for api {api:?}"))?,
+                ),
+                _ => None,
+            };
+            let resp = Resp::<T> {
+                code: raw.code,
+                message: raw.message,
+                data,
+                action: raw.action,
+            };
+            log::debug!("api {:#?} resp: {:#?}", api, resp);
+            return Ok(resp);
+        }
+
+        bail!("request retry loop exhausted for {api:?}")
     }
 
     fn parse_time_offset_from_date_header(&mut self, resp: &Response) {
+        if let Some(offset) = Self::time_offset_from_date_header(resp) {
+            self.date_offset_sec = offset;
+        }
+    }
+
+    fn time_offset_from_date_header(resp: &Response) -> Option<i32> {
         let headers = resp.headers();
         if let Some(date) = headers.get("date") {
             match date.to_str() {
                 Ok(date) => match httpdate::parse_http_date(date) {
                     Ok(date) => {
                         let now = SystemTime::now();
-                        self.date_offset_sec = if now < date {
+                        let offset = if now < date {
                             let date_offset = date
                                 .duration_since(now)
                                 .unwrap_or_else(|_| Duration::from_secs(0));
@@ -373,6 +423,7 @@ impl Client {
                             let offset: i32 = date_offset.as_secs().try_into().unwrap_or_default();
                             -offset
                         };
+                        return Some(offset);
                     }
                     Err(e) => {
                         log::warn!("failed to parse date in header, ignore it: {}", e);
@@ -381,6 +432,7 @@ impl Client {
                 Err(e) => log::warn!("failed to read date header: {}", e),
             }
         }
+        None
     }
 
     pub fn need_login(&self) -> bool {
@@ -879,6 +931,72 @@ impl Client {
         None
     }
 
+    /// 当前时间戳（秒），已按服务器 Date 头校正。
+    fn current_timestamp(&self) -> i64 {
+        Utc::now().timestamp() + self.date_offset_sec as i64
+    }
+
+    /// 按 cookie jar 顺序拼 "name=value"，用 "; " 连接（供签名的 cookieStr 用）。
+    /// 顺序须与 reqwest 实际发送的 Cookie 头一致——两者都源自同一 jar。
+    fn cookie_header_for(&self, url: &Url) -> Result<String> {
+        let store = self
+            .cookie
+            .lock()
+            .map_err(|e| anyhow!("failed to lock cookie store: {e}"))?;
+        let pairs: Vec<String> = store
+            .get_request_values(url)
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        Ok(pairs.join("; "))
+    }
+
+    /// 若该 path 需要签名，返回 (header_name, header_value)。
+    #[cfg(test)]
+    fn build_sign_header(
+        &self,
+        method: &str,
+        url: &Url,
+        body: &[u8],
+    ) -> Result<Option<(String, String)>> {
+        let cookie_str = self.cookie_header_for(url)?;
+        let csrf = cookie_value(&cookie_str, "csrf-token").unwrap_or("");
+
+        self.build_sign_header_with_cookie(method, url, body, &cookie_str, csrf)
+    }
+
+    fn build_sign_header_with_cookie(
+        &self,
+        method: &str,
+        url: &Url,
+        body: &[u8],
+        cookie_str: &str,
+        csrf: &str,
+    ) -> Result<Option<(String, String)>> {
+        let path = url.path();
+        let mask = match sign::sign_mask_by_path(path) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let company = &self.conf.company_name;
+        let device_id = self
+            .conf
+            .device_id
+            .as_deref()
+            .context("device_id required for request signing")?;
+        if csrf.is_empty() && (mask >> 7) & 1 == 1 {
+            log::warn!(
+                "no csrf-token cookie for signed endpoint {} (mask {:#x}); signing with empty csrf, signature may be rejected",
+                url.path(),
+                mask
+            );
+        }
+        let query = url.query().unwrap_or("");
+        let value = sign::compute_sign(
+            company, device_id, method, path, query, body, cookie_str, csrf, mask,
+        );
+        Ok(Some((sign::SIGN_HEADER.to_string(), value)))
+    }
+
     fn vpn_endpoint_url(&self, host: &str, api_port: u16) -> Result<Url> {
         let server_url = self
             .conf
@@ -955,44 +1073,83 @@ impl Client {
         let mut api_url = self.api_url.clone();
         api_url.vpn_param.url = endpoint_url.to_string().trim_end_matches('/').to_string();
 
-        let mut request = self
-            .probe_client
-            .get(api_url.get_api_url(&ApiName::PingVPN));
-        if let Some(cookies) = self.probe_cookie_header()? {
-            request = request.header(header::COOKIE, cookies);
-        }
-
+        let cookie_header = self.probe_cookie_header()?;
+        let cookie_str = match cookie_header.as_ref() {
+            Some(value) => value
+                .to_str()
+                .context("VPN probe Cookie header is not valid text")?
+                .to_owned(),
+            None => String::new(),
+        };
+        let csrf = cookie_value(&cookie_str, "csrf-token")
+            .unwrap_or("")
+            .to_owned();
         let started = Instant::now();
-        let response = request.send().await.context("VPN probe request failed")?;
-        let status = response.status();
-        let set_cookie_headers = response
-            .headers()
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .cloned()
-            .collect();
-        let body = response
-            .text()
-            .await
-            .context("failed to read VPN probe response body")?;
-        let latency_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        let mut date_offset_sec = self.date_offset_sec;
 
-        if !status.is_success() {
-            bail!("VPN probe returned HTTP status {status}");
+        for attempt in 0..2 {
+            let url_str = api_url.get_api_url(&ApiName::PingVPN);
+            let mut url = Url::from_str(&url_str)
+                .with_context(|| format!("invalid VPN probe url {url_str}"))?;
+            let timestamp = Utc::now().timestamp() + date_offset_sec as i64;
+            url.query_pairs_mut()
+                .append_pair("timestamp", &timestamp.to_string());
+            let sign_header =
+                self.build_sign_header_with_cookie("GET", &url, b"", &cookie_str, &csrf)?;
+
+            let mut request = self.probe_client.get(url);
+            if let Some(cookies) = cookie_header.as_ref() {
+                request = request.header(header::COOKIE, cookies);
+            }
+            if !csrf.is_empty() {
+                request = request.header("csrf-token", &csrf);
+            }
+            if let Some((name, value)) = sign_header {
+                request = request.header(name, value);
+            }
+
+            let response = request.send().await.context("VPN probe request failed")?;
+            if let Some(offset) = Self::time_offset_from_date_header(&response) {
+                date_offset_sec = offset;
+            }
+            let status = response.status();
+            let set_cookie_headers = response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .cloned()
+                .collect();
+            let body = response
+                .text()
+                .await
+                .context("failed to read VPN probe response body")?;
+
+            if !status.is_success() {
+                bail!("VPN probe returned HTTP status {status}");
+            }
+            let resp: Resp<Value> = serde_json::from_str(&body)
+                .with_context(|| format!("failed to parse VPN probe response: {body}"))?;
+            if attempt == 0 && SIGN_RETRY_CODES.contains(&resp.code) {
+                log::warn!(
+                    "VPN probe sign timestamp rejected (code {}), retrying once",
+                    resp.code
+                );
+                continue;
+            }
+            return match resp.code {
+                0 => Ok(VpnProbeResponse {
+                    latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                    set_cookie_headers,
+                }),
+                _ => bail!(format!(
+                    "failed to ping vpn with error {}: {}",
+                    resp.code,
+                    resp.message.unwrap_or_default()
+                )),
+            };
         }
-        let resp: Resp<Value> = serde_json::from_str(&body)
-            .with_context(|| format!("failed to parse VPN probe response: {body}"))?;
-        match resp.code {
-            0 => Ok(VpnProbeResponse {
-                latency_ms,
-                set_cookie_headers,
-            }),
-            _ => bail!(format!(
-                "failed to ping vpn with error {}: {}",
-                resp.code,
-                resp.message.unwrap_or_default()
-            )),
-        }
+
+        bail!("VPN probe retry loop exhausted")
     }
 
     async fn fetch_peer_info(&mut self, public_key: &String) -> Result<RespWgInfo> {
@@ -1418,6 +1575,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use cookie::Cookie as RawCookie;
+    use cookie_store::CookieStore;
+    use reqwest::{ClientBuilder, Url};
+    use reqwest_cookie_store::CookieStoreMutex;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1425,8 +1586,10 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{merge_additional_routes, resolve_additional_domains, Client, ReqwestCookieStore};
+    use crate::api::{ApiName, ApiUrl};
     use crate::config::Config;
     use crate::resp::RespVpnInfo;
+    use crate::sign;
     use crate::utils::apply_route_filters;
 
     async fn start_probe_server(
@@ -1467,6 +1630,94 @@ mod tests {
         (port, request_rx, task)
     }
 
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn request_header<'a>(request: &'a str, expected_name: &str) -> Option<&'a str> {
+        request.lines().skip(1).find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(expected_name)
+                .then_some(value.trim())
+        })
+    }
+
+    fn assert_valid_wire_signature(request: &str, company: &str, device_id: &str) -> i64 {
+        let request_line = request.lines().next().unwrap();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap();
+        let target = parts.next().unwrap();
+        let url = Url::parse(&format!("http://localhost{target}")).unwrap();
+        let cookie = request_header(request, "cookie").unwrap_or("");
+        let csrf = request_header(request, "csrf-token").unwrap_or("");
+        let actual = request_header(request, sign::SIGN_HEADER).expect("missing Sign header");
+        let mask = sign::sign_mask_by_path(url.path()).expect("path should be signed");
+        let expected = sign::compute_sign(
+            company,
+            device_id,
+            method,
+            url.path(),
+            url.query().unwrap_or(""),
+            b"",
+            cookie,
+            csrf,
+            mask,
+        );
+        assert_eq!(actual, expected);
+
+        url.query_pairs()
+            .find_map(|(name, value)| (name == "timestamp").then(|| value.parse().unwrap()))
+            .expect("missing timestamp")
+    }
+
+    async fn start_sign_retry_server() -> (
+        u16,
+        oneshot::Receiver<Vec<String>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (requests_tx, requests_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut stream).await);
+
+                let body = if attempt == 0 {
+                    r#"{"code":11020001,"message":"expired","data":{"unexpected":true}}"#
+                } else {
+                    r#"{"code":0,"data":[]}"#
+                };
+                let server_time = if attempt == 0 {
+                    SystemTime::now() + Duration::from_secs(120)
+                } else {
+                    SystemTime::now()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nDate: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    httpdate::fmt_http_date(server_time),
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests_tx.send(requests).unwrap();
+        });
+        (port, requests_rx, task)
+    }
+
     fn vpn_info(port: u16, name: &str) -> RespVpnInfo {
         RespVpnInfo {
             api_port: port,
@@ -1500,7 +1751,15 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        Client::new(conf).unwrap()
+        let client = Client::new(conf).unwrap();
+        let server_url = Url::parse("http://127.0.0.1").unwrap();
+        client
+            .cookie
+            .lock()
+            .unwrap()
+            .insert_raw(&RawCookie::new("csrf-token", "fresh-csrf"), &server_url)
+            .unwrap();
+        client
     }
 
     #[tokio::test]
@@ -1537,6 +1796,12 @@ mod tests {
         assert!(second_request.contains("cookie: device_id=test-device"));
         assert!(first_request.contains("user-agent: corplink/201000 "));
         assert!(second_request.contains("user-agent: corplink/201000 "));
+        assert!(first_request.contains("get /vpn/ping?os=android&os_version=2&timestamp="));
+        assert!(second_request.contains("get /vpn/ping?os=android&os_version=2&timestamp="));
+        assert!(first_request.contains("sign: v1;"));
+        assert!(second_request.contains("sign: v1;"));
+        assert!(first_request.contains("csrf-token: fresh-csrf"));
+        assert!(second_request.contains("csrf-token: fresh-csrf"));
 
         {
             let cookie_store = client.cookie.lock().unwrap();
@@ -1593,6 +1858,72 @@ mod tests {
         fast_request.await.unwrap();
         slow_task.await.unwrap();
         fast_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_request_retries_with_current_csrf_and_refreshed_timestamp() {
+        let (port, requests_rx, server_task) = start_sign_retry_server().await;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let server_url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        let mut conf: Config = serde_json::from_value(json!({
+            "company_name": "test",
+            "username": "test",
+            "server": server_url.as_str().trim_end_matches('/'),
+            "interface_name": format!("corplink-sign-test-{unique}"),
+            "device_id": "test-device"
+        }))
+        .unwrap();
+        conf.conf_file = Some(
+            std::env::temp_dir()
+                .join(format!("corplink-sign-test-{unique}.json"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let mut client = Client::new(conf).unwrap();
+        client
+            .cookie
+            .lock()
+            .unwrap()
+            .insert_raw(&RawCookie::new("csrf-token", "fresh-csrf"), &server_url)
+            .unwrap();
+
+        let response = client
+            .request::<Vec<serde_json::Value>>(ApiName::ListVPN, None)
+            .await
+            .unwrap();
+        assert_eq!(response.code, 0);
+
+        let requests = requests_rx.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(request_header(request, "csrf-token"), Some("fresh-csrf"));
+        }
+        let first_timestamp = assert_valid_wire_signature(&requests[0], "test", "test-device");
+        let second_timestamp = assert_valid_wire_signature(&requests[1], "test", "test-device");
+        assert!(second_timestamp - first_timestamp >= 100);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_probe_retries_with_refreshed_timestamp() {
+        let (port, requests_rx, server_task) = start_sign_retry_server().await;
+        let client = test_client();
+
+        let selected = client
+            .get_first_available_vpn(vec![vpn_info(port, "retry-node")])
+            .await
+            .expect("probe should retry after a sign timestamp rejection");
+        assert_eq!(selected.vpn.en_name, "retry-node");
+
+        let requests = requests_rx.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let first_timestamp = assert_valid_wire_signature(&requests[0], "test", "test-device");
+        let second_timestamp = assert_valid_wire_signature(&requests[1], "test", "test-device");
+        assert!(second_timestamp - first_timestamp >= 100);
+        server_task.await.unwrap();
     }
 
     #[test]
@@ -1663,5 +1994,68 @@ mod tests {
         let routes = resolve_additional_domains(&["127.0.0.1".to_string()], false).await;
 
         assert_eq!(routes, vec!["127.0.0.1/32"]);
+    }
+
+    /// 构造一个仅用于签名决策测试的最小 Config（不触碰文件/网络）。
+    fn sign_test_config(device_id: Option<&str>) -> Config {
+        let mut v = json!({
+            "company_name": "TestCo",
+            "username": "tester",
+            "server": "https://example.com",
+        });
+        if let Some(d) = device_id {
+            v["device_id"] = json!(d);
+        }
+        serde_json::from_value(v).expect("valid test config")
+    }
+
+    /// 就地构造一个 Client，跳过 Client::new 的 cookie 文件加载逻辑。
+    fn sign_test_client(conf: Config) -> Client {
+        let cookie = Arc::new(CookieStoreMutex::new(CookieStore::default()));
+        let c = ClientBuilder::new().build().expect("build reqwest client");
+        let api_url = ApiUrl::new(&conf).expect("build api url");
+        Client {
+            conf,
+            cookie,
+            probe_client: c.clone(),
+            c,
+            api_url,
+            date_offset_sec: 0,
+        }
+    }
+
+    #[test]
+    fn build_sign_header_skips_unsigned_path() {
+        let client = sign_test_client(sign_test_config(Some("dev-123")));
+        let url = Url::parse("https://example.com/api/other").unwrap();
+        let out = client
+            .build_sign_header("GET", &url, b"")
+            .expect("build_sign_header ok");
+        assert!(out.is_none(), "unsigned path must not produce a Sign header");
+    }
+
+    #[test]
+    fn build_sign_header_signs_known_path() {
+        let client = sign_test_client(sign_test_config(Some("dev-123")));
+        let url = Url::parse("https://example.com/api/vpn/list").unwrap();
+        let (name, value) = client
+            .build_sign_header("GET", &url, b"")
+            .expect("build_sign_header ok")
+            .expect("signed path should produce a header");
+        assert_eq!(name, sign::SIGN_HEADER);
+        assert!(value.starts_with("v1;"), "unexpected sign value: {value}");
+    }
+
+    #[test]
+    fn build_sign_header_requires_device_id() {
+        let client = sign_test_client(sign_test_config(None));
+        let url = Url::parse("https://example.com/api/vpn/list").unwrap();
+        let err = client
+            .build_sign_header("GET", &url, b"")
+            .expect_err("missing device_id must be an error");
+        assert!(
+            err.to_string().contains("device_id"),
+            "unexpected error: {err}"
+        );
     }
 }
