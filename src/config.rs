@@ -198,5 +198,8 @@ pub struct WgConf {
     pub dns: String,
 
     // corplink confs
+    /// `/vpn/conn` 分配的原始 IPv4 地址（不含 WireGuard CIDR 掩码）。
+    /// `/vpn/report` 的 `ip` 字段要求使用此值，而不是 `address`。
+    pub vpn_ip: String,
     pub protocol: i32,
 }
