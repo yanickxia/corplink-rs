@@ -34,8 +34,6 @@ use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
 const SIGN_RETRY_CODES: [i32; 2] = [11020001, 11020002];
-const VPN_GATEWAY_REFRESH_INTERVAL: Duration = Duration::from_secs(240);
-
 fn cookie_value<'a>(cookie_header: &'a str, expected_name: &str) -> Option<&'a str> {
     cookie_header
         .split(';')
@@ -145,10 +143,10 @@ pub struct Client {
     probe_client: reqwest::Client,
     api_url: ApiUrl,
     date_offset_sec: i32,
-    /// 数据面 `jwt-token` 请求头。飞连的网关请求会轮换 `vpn-token`
-    /// Cookie，但官方客户端会到下一次成功上报后才切换请求头。
+    /// 数据面 `jwt-token` 请求头，固定为选中节点探测后用于建连的 token。
+    /// 控制面请求可能轮换 Cookie 中的 `vpn-token`，但官方客户端的后续
+    /// `/vpn/report` 仍保持这个建连 token。
     vpn_jwt: Option<String>,
-    vpn_gateway_refreshed_at: Option<Instant>,
 }
 
 struct VpnProbeResponse {
@@ -258,7 +256,6 @@ impl Client {
             api_url: ApiUrl::new(&conf_bak)?,
             date_offset_sec: 0,
             vpn_jwt: None,
-            vpn_gateway_refreshed_at: None,
         })
     }
 
@@ -361,8 +358,8 @@ impl Client {
             if !cookie_str.is_empty() {
                 rb = rb.header(header::COOKIE, &cookie_str);
             }
-            // 数据面端点使用独立维护的 jwt-token；它可能比 Cookie jar 中刚轮换的
-            // vpn-token 落后一轮。其他端点继续直接使用当前 Cookie 值。
+            // 数据面端点使用建连时固定的 jwt-token；Cookie jar 中的 vpn-token
+            // 后续即使轮换，也不能替换这个请求头。其他端点使用当前 Cookie 值。
             if let Some(jwt) = request_jwt.as_deref() {
                 rb = rb.header("jwt-token", jwt);
             }
@@ -400,13 +397,6 @@ impl Client {
             let raw: Resp<Value> = serde_json::from_str(&text).with_context(|| {
                 format!("failed to parse response envelope for api {api:?}: {text}")
             })?;
-
-            // 真机时序：网关请求可能已经安装新 vpn-token Cookie，但本次
-            // /vpn/report 仍用旧 jwt-token 请求头；只有本次业务成功后，下一次
-            // 上报才采用“本次请求 Cookie 中”的 token。
-            if raw.code == 0 && url.path() == "/vpn/report" {
-                self.vpn_jwt = cookie_jwt;
-            }
 
             // 签名时间戳过期错误：刷新后重试一次
             if attempt == 0 && SIGN_RETRY_CODES.contains(&raw.code) {
@@ -894,7 +884,7 @@ impl Client {
                 Ok(response) => {
                     log::info!(
                         "server name {}, latency {}ms",
-                        vpn.en_name,
+                        vpn.display_name(),
                         response.latency_ms
                     );
                     let should_replace = match &fastest {
@@ -950,7 +940,7 @@ impl Client {
                     Ok(response) => {
                         log::info!(
                             "server name {}, latency {}ms",
-                            vpn.en_name,
+                            vpn.display_name(),
                             response.latency_ms
                         );
                         return Some(SelectedVpn {
@@ -1121,18 +1111,6 @@ impl Client {
         Ok(url)
     }
 
-    async fn refresh_vpn_gateway_session(&mut self) -> Result<()> {
-        let endpoint_url = Url::from_str(&self.api_url.vpn_param.url)
-            .context("invalid active VPN endpoint URL")?;
-        // 安卓客户端会在建连后及运行过程中通过网关监控请求刷新 session/vpn-token。
-        // 这里复用已验证的只读列表接口完成相同的会话续期，再把网关域 Cookie 同步到
-        // IP 数据面；旧 vpn_jwt 暂不推进，由下一次成功 /vpn/report 完成过渡。
-        self.list_vpn().await?;
-        self.sync_gateway_cookies_to_endpoint(&endpoint_url)?;
-        self.vpn_gateway_refreshed_at = Some(Instant::now());
-        Ok(())
-    }
-
     // ping vpn and return latency in ms. Will return Err on error
     async fn ping_vpn(&self, ip: &str, api_port: u16) -> Result<VpnProbeResponse> {
         let endpoint_url = self.vpn_endpoint_url(ip, api_port)?;
@@ -1296,15 +1274,15 @@ impl Client {
             vpn_info.len(),
             vpn_info
                 .iter()
-                .map(|i| i.en_name.clone())
+                .map(|i| i.display_name().to_string())
                 .collect::<Vec<String>>()
         );
         let filtered_vpn = vpn_info
             .into_iter()
             .filter(|vpn| {
                 if let Some(server_name) = self.conf.vpn_server_name.clone() {
-                    if vpn.en_name != server_name {
-                        log::info!("skip {}, expect {}", vpn.en_name, server_name);
+                    if vpn.display_name() != server_name {
+                        log::info!("skip {}, expect {}", vpn.display_name(), server_name);
                         return false;
                     }
                 }
@@ -1322,7 +1300,7 @@ impl Client {
                     _ => {
                         log::info!(
                             "server name {} is not support {} wg for now",
-                            vpn.en_name,
+                            vpn.display_name(),
                             mode
                         );
                         false
@@ -1350,7 +1328,7 @@ impl Client {
             &endpoint_url,
         );
         // `/vpn/conn` 的签名和 jwt-token 请求头从选中节点探测后得到的
-        // vpn-token 起步；随后 `/vpn/report` 按官方客户端的一轮滞后时序推进。
+        // vpn-token 起步；后续 `/vpn/report` 始终保持这个建连 token。
         let endpoint_cookie = self.cookie_header_for(&endpoint_url)?;
         self.vpn_jwt = cookie_value(&endpoint_cookie, "vpn-token").map(str::to_owned);
         self.save_cookie()?;
@@ -1358,7 +1336,11 @@ impl Client {
             Ok(ip) => SocketAddr::new(ip, vpn.vpn_port).to_string(),
             Err(_) => format!("{}:{}", vpn.ip, vpn.vpn_port),
         };
-        log::info!("try connect to {}, address {}", vpn.en_name, vpn_addr);
+        log::info!(
+            "try connect to {}, address {}",
+            vpn.display_name(),
+            vpn_addr
+        );
 
         let key = self
             .conf
@@ -1557,31 +1539,12 @@ impl Client {
                 },
             },
         };
-        // 官方客户端在连接建立后会立即触发一次网关侧上报并轮换首个
-        // vpn-token；这里同步该会话生命周期，避免数据面凭据逐渐漂移。
-        self.refresh_vpn_gateway_session()
-            .await
-            .context("failed to refresh VPN gateway session after connecting")?;
         Ok(wg_conf)
     }
 
     pub async fn keep_alive_vpn(&mut self, conf: &WgConf, interval: u64) {
         loop {
             log::info!("keep alive");
-            let needs_gateway_refresh = self
-                .vpn_gateway_refreshed_at
-                .map(|at| at.elapsed() >= VPN_GATEWAY_REFRESH_INTERVAL)
-                .unwrap_or(true);
-            if needs_gateway_refresh {
-                match self.refresh_vpn_gateway_session().await {
-                    Ok(()) => log::info!("refreshed VPN gateway session"),
-                    Err(err) => {
-                        // 网关续期是预防性操作；短暂失败时仍尝试数据面心跳，
-                        // 避免一次瞬时网络错误直接拆除隧道。
-                        log::warn!("failed to refresh VPN gateway session: {err}");
-                    }
-                }
-            }
             match self.report_vpn_status(conf).await {
                 Ok(_) => (),
                 Err(err) => {
@@ -2071,7 +2034,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vpn_report_jwt_header_lags_rotated_cookie_by_one_successful_request() {
+    async fn vpn_report_jwt_header_remains_pinned_when_cookie_rotates() {
         let (port, requests_rx, server_task) = start_report_server().await;
         let endpoint_url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
         let mut client = test_client();
@@ -2117,7 +2080,7 @@ mod tests {
                 .and_then(|value| super::cookie_value(value, "vpn-token")),
             Some("token-b")
         );
-        assert_eq!(request_header(&requests[2], "jwt-token"), Some("token-b"));
+        assert_eq!(request_header(&requests[2], "jwt-token"), Some("token-a"));
         assert_eq!(
             request_header(&requests[2], "cookie")
                 .and_then(|value| super::cookie_value(value, "vpn-token")),
@@ -2258,7 +2221,6 @@ mod tests {
             api_url,
             date_offset_sec: 0,
             vpn_jwt: None,
-            vpn_gateway_refreshed_at: None,
         }
     }
 
