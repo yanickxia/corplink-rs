@@ -37,15 +37,19 @@ jobs:
           pkgname: "pack"
       - name: rename package for release
         run: |
-          set -- pack/corplink-rs-*.pkg.tar.zst
-          test "$#" -eq 1
-          test -f "$1"
-          mv "$1" "pack/corplink-rs-${{ github.ref_name }}-archlinux-$(uname -m).pkg.tar.zst"
+          mapfile -t packages < <(
+            find pack -maxdepth 1 -type f \
+              -name 'corplink-rs-*.pkg.tar.zst' \
+              ! -name 'corplink-rs-debug-*' \
+              -print
+          )
+          test "${#packages[@]}" -eq 1
+          mv "${packages[0]}" "pack/corplink-rs-${{ github.ref_name }}-archlinux-$(uname -m).pkg.tar.zst"
       - name: upload package to artifact
         uses: actions/upload-artifact@v6
         with:
           name: archlinux-package
-          path: pack/corplink-rs-*.pkg.tar.zst
+          path: pack/corplink-rs-${{ github.ref_name }}-archlinux-*.pkg.tar.zst
       - name: upload package to release
         uses: svenstaro/upload-release-action@v2
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
