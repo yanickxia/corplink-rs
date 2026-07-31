@@ -2,11 +2,11 @@ name: release
 
 on:
   push:
-    branches:
-      - master
     tags:
-      - "test-release"
-      - "[0-9]+\\.[0-9]+"
+      - "bytedance-[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: write
 
 jobs:
   create-release:
@@ -17,8 +17,8 @@ jobs:
         uses: actions/create-release@v1
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         with:
-          tag_name: ${{ github.ref }}
-          release_name: ${{ github.ref }}
+          tag_name: ${{ github.ref_name }}
+          release_name: ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -35,11 +35,21 @@ jobs:
         with:
           target: "pkgbuild"
           pkgname: "pack"
+      - name: rename package for release
+        run: |
+          mapfile -t packages < <(
+            find pack -maxdepth 1 -type f \
+              -name 'corplink-rs-*.pkg.tar.zst' \
+              ! -name 'corplink-rs-debug-*' \
+              -print
+          )
+          test "${#packages[@]}" -eq 1
+          mv "${packages[0]}" "pack/corplink-rs-${{ github.ref_name }}-archlinux-$(uname -m).pkg.tar.zst"
       - name: upload package to artifact
         uses: actions/upload-artifact@v6
         with:
           name: archlinux-package
-          path: pack/corplink-rs-*.pkg.tar.zst
+          path: pack/corplink-rs-${{ github.ref_name }}-archlinux-*.pkg.tar.zst
       - name: upload package to release
         uses: svenstaro/upload-release-action@v2
         if: ${{ startsWith(github.ref, 'refs/tags/') }}

@@ -77,6 +77,45 @@ pub struct RespVpnInfo {
     pub timeout: i32,
 }
 
+impl RespVpnInfo {
+    pub fn display_name(&self) -> &str {
+        if self.en_name.is_empty() {
+            &self.name
+        } else {
+            &self.en_name
+        }
+    }
+}
+
+#[cfg(test)]
+mod vpn_info_tests {
+    use super::RespVpnInfo;
+
+    fn vpn_info(name: &str, en_name: &str) -> RespVpnInfo {
+        RespVpnInfo {
+            api_port: 443,
+            vpn_port: 80,
+            ip: "192.0.2.1".to_string(),
+            protocol_mode: 2,
+            name: name.to_string(),
+            en_name: en_name.to_string(),
+            icon: String::new(),
+            id: 1,
+            timeout: 0,
+        }
+    }
+
+    #[test]
+    fn display_name_falls_back_to_localized_name() {
+        assert_eq!(vpn_info("CN-LF7", "").display_name(), "CN-LF7");
+    }
+
+    #[test]
+    fn display_name_prefers_english_name() {
+        assert_eq!(vpn_info("本地名称", "CN-LF7").display_name(), "CN-LF7");
+    }
+}
+
 #[derive(serde::Deserialize, Debug)]
 pub struct RespWgExtraInfo {
     pub vpn_mtu: u32,
