@@ -34,6 +34,8 @@ use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
 const SIGN_RETRY_CODES: [i32; 2] = [11020001, 11020002];
+const VPN_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(240);
+
 fn cookie_value<'a>(cookie_header: &'a str, expected_name: &str) -> Option<&'a str> {
     cookie_header
         .split(';')
@@ -143,10 +145,11 @@ pub struct Client {
     probe_client: reqwest::Client,
     api_url: ApiUrl,
     date_offset_sec: i32,
-    /// 数据面 `jwt-token` 请求头，固定为选中节点探测后用于建连的 token。
-    /// 控制面请求可能轮换 Cookie 中的 `vpn-token`，但官方客户端的后续
-    /// `/vpn/report` 仍保持这个建连 token。
+    /// 数据面 `jwt-token` 请求头。官方客户端轮换 `vpn-token` Cookie 时，
+    /// 当前 `/vpn/report` 仍使用旧 jwt-token；本次上报成功后，下一次才
+    /// 将 jwt-token 推进到当前 Cookie 中的 token。
     vpn_jwt: Option<String>,
+    vpn_token_refreshed_at: Option<Instant>,
 }
 
 struct VpnProbeResponse {
@@ -256,6 +259,7 @@ impl Client {
             api_url: ApiUrl::new(&conf_bak)?,
             date_offset_sec: 0,
             vpn_jwt: None,
+            vpn_token_refreshed_at: None,
         })
     }
 
@@ -358,8 +362,8 @@ impl Client {
             if !cookie_str.is_empty() {
                 rb = rb.header(header::COOKIE, &cookie_str);
             }
-            // 数据面端点使用建连时固定的 jwt-token；Cookie jar 中的 vpn-token
-            // 后续即使轮换，也不能替换这个请求头。其他端点使用当前 Cookie 值。
+            // 数据面端点使用独立维护的 jwt-token；当 Cookie 中的 vpn-token
+            // 轮换时，它会落后一轮，并在本次上报成功后推进。
             if let Some(jwt) = request_jwt.as_deref() {
                 rb = rb.header("jwt-token", jwt);
             }
@@ -397,6 +401,15 @@ impl Client {
             let raw: Resp<Value> = serde_json::from_str(&text).with_context(|| {
                 format!("failed to parse response envelope for api {api:?}: {text}")
             })?;
+
+            // 真机时序：vpn-token Cookie 可能先轮换，但当前 /vpn/report 仍用
+            // 旧 jwt-token；只有这次业务成功后，下一次上报才使用本次请求
+            // Cookie 中的 token。不能直接使用响应后的 Cookie，否则会提前一轮。
+            if raw.code == 0 && url.path() == "/vpn/report" {
+                if let Some(cookie_jwt) = cookie_jwt {
+                    self.vpn_jwt = Some(cookie_jwt);
+                }
+            }
 
             // 签名时间戳过期错误：刷新后重试一次
             if attempt == 0 && SIGN_RETRY_CODES.contains(&raw.code) {
@@ -1104,11 +1117,48 @@ impl Client {
         Ok(())
     }
 
+    fn sync_gateway_vpn_token_to_endpoint(&self, url: &Url) -> Result<()> {
+        let server_url = self
+            .conf
+            .server
+            .as_ref()
+            .context("server url is required to refresh VPN token")?;
+        let server_url = Url::from_str(server_url)
+            .with_context(|| format!("invalid server url: {server_url}"))?;
+        let gateway_cookie = self.cookie_header_for(&server_url)?;
+        let vpn_token = cookie_value(&gateway_cookie, "vpn-token")
+            .context("gateway vpn-token missing after refresh")?;
+
+        // 只把轮换后的 vpn-token 送进数据面 Cookie。数据面的 session/csrf-token
+        // 属于建连身份，覆盖成控制面刚刷新的值会让网关立即返回 code 1000。
+        let raw_cookie = RawCookie::new("vpn-token", vpn_token.to_string());
+        let endpoint_cookie = Cookie::try_from_raw_cookie(&raw_cookie, url)
+            .context("failed to convert refreshed vpn-token")?;
+        self.cookie
+            .lock()
+            .map_err(|e| anyhow!("failed to lock cookie store: {e}"))?
+            .insert(endpoint_cookie, url)
+            .context("failed to install refreshed vpn-token")?;
+        Ok(())
+    }
+
     fn prepare_vpn_endpoint(&mut self, ip: &str, api_port: u16) -> Result<Url> {
         let url = self.vpn_endpoint_url(ip, api_port)?;
         self.sync_gateway_cookies_to_endpoint(&url)?;
         self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
         Ok(url)
+    }
+
+    async fn refresh_vpn_token(&mut self) -> Result<()> {
+        let endpoint_url = Url::from_str(&self.api_url.vpn_param.url)
+            .context("invalid active VPN endpoint URL")?;
+
+        // Android 会通过控制面请求轮换 vpn-token，但 VPN 进程仍保留原来的
+        // session/csrf-token。复用列表接口触发续期后，只同步 vpn-token。
+        self.list_vpn().await?;
+        self.sync_gateway_vpn_token_to_endpoint(&endpoint_url)?;
+        self.vpn_token_refreshed_at = Some(Instant::now());
+        Ok(())
     }
 
     // ping vpn and return latency in ms. Will return Err on error
@@ -1328,7 +1378,7 @@ impl Client {
             &endpoint_url,
         );
         // `/vpn/conn` 的签名和 jwt-token 请求头从选中节点探测后得到的
-        // vpn-token 起步；后续 `/vpn/report` 始终保持这个建连 token。
+        // vpn-token 起步；后续 `/vpn/report` 按官方客户端的一轮滞后时序推进。
         let endpoint_cookie = self.cookie_header_for(&endpoint_url)?;
         self.vpn_jwt = cookie_value(&endpoint_cookie, "vpn-token").map(str::to_owned);
         self.save_cookie()?;
@@ -1539,12 +1589,26 @@ impl Client {
                 },
             },
         };
+        self.vpn_token_refreshed_at = Some(Instant::now());
         Ok(wg_conf)
     }
 
     pub async fn keep_alive_vpn(&mut self, conf: &WgConf, interval: u64) {
         loop {
             log::info!("keep alive");
+            let needs_token_refresh = self
+                .vpn_token_refreshed_at
+                .map(|at| at.elapsed() >= VPN_TOKEN_REFRESH_INTERVAL)
+                .unwrap_or(true);
+            if needs_token_refresh {
+                match self.refresh_vpn_token().await {
+                    Ok(()) => log::info!("refreshed VPN token"),
+                    Err(err) => {
+                        // 续期是预防性操作；短暂失败时仍尝试数据面心跳。
+                        log::warn!("failed to refresh VPN token: {err}");
+                    }
+                }
+            }
             match self.report_vpn_status(conf).await {
                 Ok(_) => (),
                 Err(err) => {
@@ -2034,7 +2098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vpn_report_jwt_header_remains_pinned_when_cookie_rotates() {
+    async fn vpn_report_jwt_header_advances_one_successful_request_after_cookie_rotates() {
         let (port, requests_rx, server_task) = start_report_server().await;
         let endpoint_url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
         let mut client = test_client();
@@ -2080,7 +2144,7 @@ mod tests {
                 .and_then(|value| super::cookie_value(value, "vpn-token")),
             Some("token-b")
         );
-        assert_eq!(request_header(&requests[2], "jwt-token"), Some("token-a"));
+        assert_eq!(request_header(&requests[2], "jwt-token"), Some("token-b"));
         assert_eq!(
             request_header(&requests[2], "cookie")
                 .and_then(|value| super::cookie_value(value, "vpn-token")),
@@ -2116,6 +2180,54 @@ mod tests {
         // cookie_header_for(数据面 url) 应能取到 device_id 等 cookie。
         let data_plane_cookie = client.cookie_header_for(&ipv6_endpoint).unwrap();
         assert!(data_plane_cookie.contains("device_id=test-device"));
+    }
+
+    #[test]
+    fn refreshing_vpn_token_preserves_data_plane_session_identity() {
+        let mut client = test_client();
+        let gateway_url = Url::parse("http://gateway.example").unwrap();
+        let endpoint_url = Url::parse("http://192.0.2.1").unwrap();
+        client.conf.server = Some(gateway_url.to_string());
+
+        {
+            let mut store = client.cookie.lock().unwrap();
+            store
+                .insert_raw(&RawCookie::new("session", "control-session"), &gateway_url)
+                .unwrap();
+            store
+                .insert_raw(&RawCookie::new("csrf-token", "control-csrf"), &gateway_url)
+                .unwrap();
+            store
+                .insert_raw(&RawCookie::new("vpn-token", "token-b"), &gateway_url)
+                .unwrap();
+            store
+                .insert_raw(&RawCookie::new("session", "data-session"), &endpoint_url)
+                .unwrap();
+            store
+                .insert_raw(&RawCookie::new("csrf-token", "data-csrf"), &endpoint_url)
+                .unwrap();
+            store
+                .insert_raw(&RawCookie::new("vpn-token", "token-a"), &endpoint_url)
+                .unwrap();
+        }
+
+        client
+            .sync_gateway_vpn_token_to_endpoint(&endpoint_url)
+            .unwrap();
+
+        let endpoint_cookie = client.cookie_header_for(&endpoint_url).unwrap();
+        assert_eq!(
+            super::cookie_value(&endpoint_cookie, "session"),
+            Some("data-session")
+        );
+        assert_eq!(
+            super::cookie_value(&endpoint_cookie, "csrf-token"),
+            Some("data-csrf")
+        );
+        assert_eq!(
+            super::cookie_value(&endpoint_cookie, "vpn-token"),
+            Some("token-b")
+        );
     }
 
     #[test]
@@ -2221,6 +2333,7 @@ mod tests {
             api_url,
             date_offset_sec: 0,
             vpn_jwt: None,
+            vpn_token_refreshed_at: None,
         }
     }
 
