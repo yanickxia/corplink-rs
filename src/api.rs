@@ -8,6 +8,7 @@ use crate::template::Template;
 
 pub const URL_GET_COMPANY: &str = "https://corplink.volcengine.cn/api/match";
 pub(crate) const CORPLINK_APP_VERSION: &str = "201000";
+pub(crate) const CORPLINK_ANDROID_APP_VERSION: &str = "3.2.16";
 
 const URL_GET_LOGIN_METHOD: &str = "{{url}}/api/login/setting?os={{os}}&os_version={{version}}";
 const URL_GET_TPS_LOGIN_METHOD: &str = "{{url}}/api/tpslogin/link?os={{os}}&os_version={{version}}";
@@ -19,12 +20,13 @@ const URL_VERIFY_CODE: &str = "{{url}}/api/login/code/verify?os={{os}}&os_versio
 const URL_LOGIN_PASSWORD: &str = "{{url}}/api/login?os={{os}}&os_version={{version}}";
 const URL_LOGIN_PASSWORD_V1: &str =
     "{{url}}/api/v1/login?os={{os}}&os_version={{version}}&client_source=FeiLian";
-const URL_LIST_VPN: &str =
-    "{{url}}/api/vpn/list?os={{os}}&os_version={{version}}&app_version={{app_version}}";
+const URL_LIST_VPN: &str = "{{url}}/api/vpn/list?os_version_patch={{os_version_patch}}&os={{os}}&app_version={{app_version}}&os_version={{os_version}}&build_number={{build_number}}&model={{model}}&language={{language}}&client_source={{client_source}}&brand={{brand}}";
 
-const URL_PING_VPN_HOST: &str = "{{url}}/vpn/ping?os={{os}}&os_version={{version}}";
-const URL_FETCH_PEER_INFO: &str = "{{url}}/vpn/conn?os={{os}}&os_version={{version}}";
-const URL_OPERATE_VPN: &str = "{{url}}/vpn/report?os={{os}}&os_version={{version}}";
+// 数据面参数需和当前安卓客户端逐项、逐序一致；/vpn/conn 的 query
+// 还会参与签名计算，心跳也应保持同一份客户端身份。
+const URL_PING_VPN_HOST: &str = "{{url}}/vpn/ping?os_version_patch={{os_version_patch}}&os={{os}}&app_version={{app_version}}&os_version={{os_version}}&build_number={{build_number}}&model={{model}}&language={{language}}&client_source={{client_source}}&brand={{brand}}";
+const URL_FETCH_PEER_INFO: &str = "{{url}}/vpn/conn?os_version_patch={{os_version_patch}}&os={{os}}&app_version={{app_version}}&os_version={{os_version}}&build_number={{build_number}}&model={{model}}&language={{language}}&client_source={{client_source}}&brand={{brand}}";
+const URL_OPERATE_VPN: &str = "{{url}}/vpn/report?os_version_patch={{os_version_patch}}&os={{os}}&app_version={{app_version}}&os_version={{os_version}}&build_number={{build_number}}&model={{model}}&language={{language}}&client_source={{client_source}}&brand={{brand}}";
 const URL_OTP: &str = "{{url}}/api/v2/p/otp?os={{os}}&os_version={{version}}";
 // log out the current terminal so it frees the server-side session/terminal
 // quota. logout_all=false only signs out this device. responds with a 302.
@@ -63,12 +65,20 @@ struct UserUrlParam {
 pub struct VpnUrlParam {
     pub url: String,
     os: String,
-    version: String,
+    os_version_patch: String,
+    app_version: String,
+    os_version: String,
+    build_number: String,
+    model: String,
+    language: String,
+    client_source: String,
+    brand: String,
 }
 
 #[derive(Clone)]
 pub struct ApiUrl {
     user_param: UserUrlParam,
+    gateway_param: VpnUrlParam,
     pub vpn_param: VpnUrlParam,
     api_template: HashMap<ApiName, Template>,
 }
@@ -107,21 +117,36 @@ impl ApiUrl {
         api_template.insert(ApiName::Otp, Template::new(URL_OTP));
         api_template.insert(ApiName::Logout, Template::new(URL_LOGOUT));
 
+        let server_url = conf
+            .server
+            .clone()
+            .context("server url missing in config")?;
+        let gateway_param = VpnUrlParam {
+            url: server_url.clone(),
+            os: os.clone(),
+            os_version_patch: "2021-01-05".to_string(),
+            app_version: CORPLINK_ANDROID_APP_VERSION.to_string(),
+            os_version: "30".to_string(),
+            build_number: "2008".to_string(),
+            model: "Phone".to_string(),
+            language: "en".to_string(),
+            client_source: "FeiLian".to_string(),
+            brand: "Genymotion".to_string(),
+        };
+        let vpn_param = VpnUrlParam {
+            url: String::new(),
+            ..gateway_param.clone()
+        };
+
         Ok(ApiUrl {
             user_param: UserUrlParam {
-                url: conf
-                    .server
-                    .clone()
-                    .context("server url missing in config")?,
+                url: server_url,
                 os: os.clone(),
                 version: version.clone(),
                 app_version: CORPLINK_APP_VERSION.to_string(),
             },
-            vpn_param: VpnUrlParam {
-                url: "".to_string(),
-                os,
-                version,
-            },
+            gateway_param,
+            vpn_param,
             api_template,
         })
     }
@@ -138,7 +163,7 @@ impl ApiUrl {
             ApiName::LoginEmail => self.api_template[name].render(user_param),
             ApiName::LoginPassword => self.api_template[name].render(user_param),
             ApiName::LoginPasswordV1 => self.api_template[name].render(user_param),
-            ApiName::ListVPN => self.api_template[name].render(user_param),
+            ApiName::ListVPN => self.api_template[name].render(&self.gateway_param),
             ApiName::Otp => self.api_template[name].render(user_param),
             ApiName::Logout => self.api_template[name].render(user_param),
 
@@ -157,7 +182,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_vpn_url_includes_app_version() {
+    fn signed_list_vpn_url_matches_current_android_parameter_order() {
         let conf: Config = serde_json::from_value(json!({
             "company_name": "test",
             "username": "test",
@@ -167,9 +192,36 @@ mod tests {
 
         let api_url = ApiUrl::new(&conf).unwrap();
 
+        let query = "os_version_patch=2021-01-05&os=Android&app_version=3.2.16&os_version=30&build_number=2008&model=Phone&language=en&client_source=FeiLian&brand=Genymotion";
         assert_eq!(
             api_url.get_api_url(&ApiName::ListVPN),
-            "https://vpn.example.com/api/vpn/list?os=Android&os_version=2&app_version=201000"
+            format!("https://vpn.example.com/api/vpn/list?{query}")
+        );
+    }
+
+    #[test]
+    fn vpn_data_plane_urls_match_current_android_parameter_order() {
+        let conf: Config = serde_json::from_value(json!({
+            "company_name": "test",
+            "username": "test",
+            "server": "https://vpn.example.com"
+        }))
+        .unwrap();
+        let mut api_url = ApiUrl::new(&conf).unwrap();
+        api_url.vpn_param.url = "https://192.0.2.1:8443".to_string();
+        let query = "os_version_patch=2021-01-05&os=Android&app_version=3.2.16&os_version=30&build_number=2008&model=Phone&language=en&client_source=FeiLian&brand=Genymotion";
+
+        assert_eq!(
+            api_url.get_api_url(&ApiName::PingVPN),
+            format!("https://192.0.2.1:8443/vpn/ping?{query}")
+        );
+        assert_eq!(
+            api_url.get_api_url(&ApiName::ConnectVPN),
+            format!("https://192.0.2.1:8443/vpn/conn?{query}")
+        );
+        assert_eq!(
+            api_url.get_api_url(&ApiName::KeepAliveVPN),
+            format!("https://192.0.2.1:8443/vpn/report?{query}")
         );
     }
 }
