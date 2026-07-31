@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 
-use crate::api::{ApiName, ApiUrl, CORPLINK_ANDROID_APP_VERSION, URL_GET_COMPANY};
+use crate::api::{ApiName, ApiUrl, URL_GET_COMPANY};
 use crate::config::{
     Config, WgConf, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1, PLATFORM_LARK, PLATFORM_LDAP,
     PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
@@ -123,15 +123,13 @@ async fn resolve_additional_domains(
     routes
 }
 
-fn corplink_client_builder() -> ClientBuilder {
+fn corplink_client_builder(user_agent: &str) -> ClientBuilder {
     ClientBuilder::new()
         // CorpLink deployments may use certificates signed by their own CA.
         .danger_accept_invalid_certs(true)
         // for debug
         // .proxy(reqwest::Proxy::all("socks5://192.168.111.233:8001").unwrap())
-        .user_agent(format!(
-            "CorpLink/{CORPLINK_ANDROID_APP_VERSION} (GenymotionPhone; Android 11; en)"
-        ))
+        .user_agent(user_agent)
         .timeout(Duration::from_millis(10000))
 }
 
@@ -238,12 +236,13 @@ impl Client {
         }
 
         let cookie_store = Arc::new(CookieStoreMutex::new(cookie_store));
+        let user_agent = conf.android_user_agent();
 
         // Keep probe responses out of the shared cookie store until an endpoint is selected.
-        let probe_client = corplink_client_builder()
+        let probe_client = corplink_client_builder(&user_agent)
             .build()
             .context("build VPN probe HTTP client")?;
-        let c = corplink_client_builder()
+        let c = corplink_client_builder(&user_agent)
             .cookie_provider(Arc::clone(&cookie_store))
             .build()
             .context("build http client")?;
@@ -1653,7 +1652,10 @@ mod tests {
     use tokio::sync::{oneshot, Barrier};
     use tokio::time::{sleep, timeout};
 
-    use super::{merge_additional_routes, resolve_additional_domains, Client, ReqwestCookieStore};
+    use super::{
+        corplink_client_builder, merge_additional_routes, resolve_additional_domains, Client,
+        ReqwestCookieStore,
+    };
     use crate::api::{ApiName, ApiUrl};
     use crate::config::{Config, WgConf};
     use crate::resp::RespVpnInfo;
@@ -1855,6 +1857,46 @@ mod tests {
             .insert_raw(&RawCookie::new("csrf-token", "fresh-csrf"), &server_url)
             .unwrap();
         client
+    }
+
+    #[tokio::test]
+    async fn custom_android_user_agent_is_applied_to_http_clients() {
+        let conf: Config = serde_json::from_value(json!({
+            "company_name": "test",
+            "username": "test",
+            "android_profile": {
+                "brand": "samsung",
+                "model": "SM-S9210",
+                "android_release": "14"
+            }
+        }))
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let user_agent = conf.android_user_agent();
+        let client = corplink_client_builder(&user_agent).build().unwrap();
+        client
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+
+        assert_eq!(
+            request_header(&request, "user-agent"),
+            Some("CorpLink/3.2.16 (samsung SM-S9210; Android 14; en)")
+        );
     }
 
     #[tokio::test]
