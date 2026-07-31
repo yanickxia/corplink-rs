@@ -9,6 +9,17 @@ use crate::utils;
 
 const DEFAULT_DEVICE_NAME: &str = "DollarOS";
 const DEFAULT_INTERFACE_NAME: &str = "corplink";
+pub(crate) const CORPLINK_ANDROID_APP_VERSION: &str = "3.2.16";
+
+const DEFAULT_ANDROID_BUILD_NUMBER: &str = "2008";
+const DEFAULT_ANDROID_BRAND: &str = "Genymotion";
+const DEFAULT_ANDROID_MODEL: &str = "Phone";
+const DEFAULT_ANDROID_RELEASE: &str = "11";
+const DEFAULT_ANDROID_SDK: &str = "30";
+const DEFAULT_ANDROID_PATCH: &str = "2021-01-05";
+const DEFAULT_ANDROID_LANGUAGE: &str = "en";
+const DEFAULT_ANDROID_CLIENT_SOURCE: &str = "FeiLian";
+const LEGACY_ANDROID_USER_AGENT: &str = "CorpLink/3.2.16 (GenymotionPhone; Android 11; en)";
 
 pub const PLATFORM_LDAP: &str = "ldap";
 pub const PLATFORM_CORPLINK: &str = "feilian";
@@ -49,6 +60,50 @@ impl fmt::Display for RouteMode {
     }
 }
 
+/// Android client identity sent to CorpLink.
+///
+/// CorpLink Web persists the corresponding values as top-level fields.  The
+/// Rust client keeps them grouped so changing the HTTP identity cannot
+/// accidentally replace the stable top-level `device_id`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct AndroidProfile {
+    pub app_version: String,
+    pub build_number: String,
+    pub brand: String,
+    pub model: String,
+    pub android_release: String,
+    pub os_version: String,
+    pub os_version_patch: String,
+    pub language: String,
+    pub client_source: String,
+}
+
+impl Default for AndroidProfile {
+    fn default() -> Self {
+        Self {
+            app_version: CORPLINK_ANDROID_APP_VERSION.to_string(),
+            build_number: DEFAULT_ANDROID_BUILD_NUMBER.to_string(),
+            brand: DEFAULT_ANDROID_BRAND.to_string(),
+            model: DEFAULT_ANDROID_MODEL.to_string(),
+            android_release: DEFAULT_ANDROID_RELEASE.to_string(),
+            os_version: DEFAULT_ANDROID_SDK.to_string(),
+            os_version_patch: DEFAULT_ANDROID_PATCH.to_string(),
+            language: DEFAULT_ANDROID_LANGUAGE.to_string(),
+            client_source: DEFAULT_ANDROID_CLIENT_SOURCE.to_string(),
+        }
+    }
+}
+
+impl AndroidProfile {
+    pub fn user_agent(&self) -> String {
+        format!(
+            "CorpLink/{} ({} {}; Android {}; {})",
+            self.app_version, self.brand, self.model, self.android_release, self.language
+        )
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub company_name: String,
@@ -58,6 +113,10 @@ pub struct Config {
     pub code: Option<String>,
     pub device_name: Option<String>,
     pub device_id: Option<String>,
+    /// Optional Android HTTP identity. This does not alter `device_id`,
+    /// `device_name`, cookies, or WireGuard keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android_profile: Option<AndroidProfile>,
     pub public_key: Option<String>,
     pub private_key: Option<String>,
     pub server: Option<String>,
@@ -117,6 +176,19 @@ impl fmt::Display for Config {
 }
 
 impl Config {
+    pub fn effective_android_profile(&self) -> AndroidProfile {
+        self.android_profile.clone().unwrap_or_default()
+    }
+
+    pub fn android_user_agent(&self) -> String {
+        self.android_profile
+            .as_ref()
+            .map(AndroidProfile::user_agent)
+            // Preserve the exact historical Rust UA unless the user opts in
+            // to a configurable Android profile.
+            .unwrap_or_else(|| LEGACY_ANDROID_USER_AGENT.to_string())
+    }
+
     pub async fn from_file(file: &str) -> Result<Config> {
         let conf_str = fs::read_to_string(file)
             .await
@@ -178,6 +250,56 @@ impl Config {
             .await
             .with_context(|| format!("failed to write config file {file}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn missing_android_profile_preserves_legacy_identity() {
+        let conf: Config = serde_json::from_value(json!({
+            "company_name": "test",
+            "username": "test"
+        }))
+        .unwrap();
+
+        assert!(conf.android_profile.is_none());
+        assert_eq!(
+            conf.android_user_agent(),
+            "CorpLink/3.2.16 (GenymotionPhone; Android 11; en)"
+        );
+        assert_eq!(conf.effective_android_profile(), AndroidProfile::default());
+    }
+
+    #[test]
+    fn partial_android_profile_uses_defaults_for_unspecified_fields() {
+        let conf: Config = serde_json::from_value(json!({
+            "company_name": "test",
+            "username": "test",
+            "device_id": "stable-device-id",
+            "android_profile": {
+                "brand": "samsung",
+                "model": "SM-S9210",
+                "android_release": "14",
+                "os_version": "34",
+                "os_version_patch": "2025-04-01"
+            }
+        }))
+        .unwrap();
+
+        let profile = conf.effective_android_profile();
+        assert_eq!(profile.app_version, "3.2.16");
+        assert_eq!(profile.build_number, "2008");
+        assert_eq!(profile.client_source, "FeiLian");
+        assert_eq!(
+            conf.android_user_agent(),
+            "CorpLink/3.2.16 (samsung SM-S9210; Android 14; en)"
+        );
+        assert_eq!(conf.device_id.as_deref(), Some("stable-device-id"));
     }
 }
 
