@@ -167,6 +167,19 @@ RUST_LOG=debug ./corplink-rs config.json
   // default is DollarOS(not CentOS)
   "device_name": "any string to describe your device",
   "device_id": "md5 of device_name or any string with same format",
+  // optional Android HTTP identity. Missing fields keep the current defaults.
+  // This does not regenerate device_id or WireGuard keys.
+  "android_profile": {
+    "app_version": "3.2.16",
+    "build_number": "2008",
+    "brand": "samsung",
+    "model": "SM-S9210",
+    "android_release": "14",
+    "os_version": "34",
+    "os_version_patch": "2025-04-01",
+    "language": "en",
+    "client_source": "FeiLian"
+  },
   "public_key": "wg public key, can be generated from private key",
   "private_key": "wg private key",
   "server": "server link",
@@ -237,6 +250,36 @@ RUST_LOG=debug ./corplink-rs config.json
   // leave unset to follow the server's protocol_mode (1 => tcp, otherwise udp).
   "force_protocol": "udp"
 }
+```
+
+## Android client profile
+
+`android_profile` controls the Android identity used by `User-Agent` and the
+ordered query parameters on `/api/vpn/list`, `/vpn/ping`, `/vpn/conn`, and
+`/vpn/report`. It is deliberately separate from the stable top-level
+`device_id`, `device_name`, cookies, and WireGuard keys, so changing the HTTP
+profile does not silently create a new CorpLink device.
+
+The Samsung example above mirrors one of the real-device presets embedded in
+`riba2534/corplink-web:31a3c0f`. Only fields that differ from the defaults need
+to be present:
+
+```json
+{
+  "android_profile": {
+    "brand": "samsung",
+    "model": "SM-S9210",
+    "android_release": "14",
+    "os_version": "34",
+    "os_version_patch": "2025-04-01"
+  }
+}
+```
+
+It produces this User-Agent:
+
+```text
+CorpLink/3.2.16 (samsung SM-S9210; Android 14; en)
 ```
 
 ## SOCKS5 / netstack 模式
