@@ -369,6 +369,8 @@ graph TD;
 
 # Changelog
 
+- 6.1.0
+  - support configurable Android client profiles
 - 0.5.5
   - add more route configs(@yanickxia @zier-one @kfxhjz @ZeppLu)
   - support protocol override config(@n-WN)
