@@ -8,7 +8,6 @@ use crate::template::Template;
 
 pub const URL_GET_COMPANY: &str = "https://corplink.volcengine.cn/api/match";
 pub(crate) const CORPLINK_APP_VERSION: &str = "201000";
-pub(crate) const CORPLINK_ANDROID_APP_VERSION: &str = "3.2.16";
 
 const URL_GET_LOGIN_METHOD: &str = "{{url}}/api/login/setting?os={{os}}&os_version={{version}}";
 const URL_GET_TPS_LOGIN_METHOD: &str = "{{url}}/api/tpslogin/link?os={{os}}&os_version={{version}}";
@@ -121,17 +120,18 @@ impl ApiUrl {
             .server
             .clone()
             .context("server url missing in config")?;
+        let android_profile = conf.effective_android_profile();
         let gateway_param = VpnUrlParam {
             url: server_url.clone(),
             os: os.clone(),
-            os_version_patch: "2021-01-05".to_string(),
-            app_version: CORPLINK_ANDROID_APP_VERSION.to_string(),
-            os_version: "30".to_string(),
-            build_number: "2008".to_string(),
-            model: "Phone".to_string(),
-            language: "en".to_string(),
-            client_source: "FeiLian".to_string(),
-            brand: "Genymotion".to_string(),
+            os_version_patch: android_profile.os_version_patch,
+            app_version: android_profile.app_version,
+            os_version: android_profile.os_version,
+            build_number: android_profile.build_number,
+            model: android_profile.model,
+            language: android_profile.language,
+            client_source: android_profile.client_source,
+            brand: android_profile.brand,
         };
         let vpn_param = VpnUrlParam {
             url: String::new(),
@@ -215,6 +215,40 @@ mod tests {
             api_url.get_api_url(&ApiName::PingVPN),
             format!("https://192.0.2.1:8443/vpn/ping?{query}")
         );
+        assert_eq!(
+            api_url.get_api_url(&ApiName::ConnectVPN),
+            format!("https://192.0.2.1:8443/vpn/conn?{query}")
+        );
+        assert_eq!(
+            api_url.get_api_url(&ApiName::KeepAliveVPN),
+            format!("https://192.0.2.1:8443/vpn/report?{query}")
+        );
+    }
+
+    #[test]
+    fn custom_android_profile_is_used_by_gateway_and_data_plane_urls() {
+        let conf: Config = serde_json::from_value(json!({
+            "company_name": "test",
+            "username": "test",
+            "server": "https://vpn.example.com",
+            "android_profile": {
+                "brand": "samsung",
+                "model": "SM-S9210",
+                "android_release": "14",
+                "os_version": "34",
+                "os_version_patch": "2025-04-01"
+            }
+        }))
+        .unwrap();
+        let mut api_url = ApiUrl::new(&conf).unwrap();
+        let query = "os_version_patch=2025-04-01&os=Android&app_version=3.2.16&os_version=34&build_number=2008&model=SM-S9210&language=en&client_source=FeiLian&brand=samsung";
+
+        assert_eq!(
+            api_url.get_api_url(&ApiName::ListVPN),
+            format!("https://vpn.example.com/api/vpn/list?{query}")
+        );
+
+        api_url.vpn_param.url = "https://192.0.2.1:8443".to_string();
         assert_eq!(
             api_url.get_api_url(&ApiName::ConnectVPN),
             format!("https://192.0.2.1:8443/vpn/conn?{query}")
