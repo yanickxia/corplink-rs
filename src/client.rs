@@ -34,7 +34,29 @@ use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
 const SIGN_RETRY_CODES: [i32; 2] = [11020001, 11020002];
-const VPN_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(240);
+// Android 主进程在 VPN 已连接时约每两分钟刷新一次节点列表；响应会轮换
+// vpn-token，VPN 进程再按一轮滞后的时序推进 jwt-token。四分钟会把旧 token
+// 推到服务端容忍窗口边缘，轻微调度抖动就可能让 /vpn/report 返回 code 1000。
+const VPN_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
+const VPN_REPORT_AUTH_REJECTED_CODE: i32 = 1000;
+
+#[derive(Debug)]
+struct VpnReportRejected {
+    code: i32,
+    message: String,
+}
+
+impl fmt::Display for VpnReportRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "failed to report connection with error {}: {}",
+            self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for VpnReportRejected {}
 
 fn cookie_value<'a>(cookie_header: &'a str, expected_name: &str) -> Option<&'a str> {
     cookie_header
@@ -1160,6 +1182,33 @@ impl Client {
         Ok(())
     }
 
+    fn align_vpn_jwt_to_endpoint_cookie(&mut self) -> Result<()> {
+        let endpoint_url = Url::from_str(&self.api_url.vpn_param.url)
+            .context("invalid active VPN endpoint URL")?;
+        let endpoint_cookie = self.cookie_header_for(&endpoint_url)?;
+        let vpn_token = cookie_value(&endpoint_cookie, "vpn-token")
+            .context("VPN endpoint vpn-token missing while recovering report authentication")?;
+        self.vpn_jwt = Some(vpn_token.to_owned());
+        Ok(())
+    }
+
+    async fn recover_vpn_report_auth(&mut self, conf: &WgConf) -> Result<()> {
+        // code 1000 可能是刷新间隔边缘上的 Cookie/jwt-token 不同步。先从
+        // 控制面重新取得 token，再让数据面的两个 token 对齐。正常路径仍保留
+        // 官方客户端的一轮滞后；这里只处理已经被服务端拒绝后的单次恢复。
+        self.refresh_vpn_token()
+            .await
+            .context("failed to refresh VPN token during report recovery")?;
+        self.align_vpn_jwt_to_endpoint_cookie()?;
+
+        // /vpn/report 使用秒级 timestamp。避免恢复请求和刚失败的请求落在同一秒，
+        // 被服务端继续当成重放。
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.report_vpn_status(conf)
+            .await
+            .context("VPN report retry after token resync failed")
+    }
+
     // ping vpn and return latency in ms. Will return Err on error
     async fn ping_vpn(&self, ip: &str, api_port: u16) -> Result<VpnProbeResponse> {
         let endpoint_url = self.vpn_endpoint_url(ip, api_port)?;
@@ -1608,7 +1657,25 @@ impl Client {
                     }
                 }
             }
-            match self.report_vpn_status(conf).await {
+            let report_result = match self.report_vpn_status(conf).await {
+                Err(err)
+                    if err
+                        .downcast_ref::<VpnReportRejected>()
+                        .is_some_and(|rejected| rejected.code == VPN_REPORT_AUTH_REJECTED_CODE) =>
+                {
+                    log::warn!(
+                        "VPN report authentication rejected (code {}), refreshing token and retrying once",
+                        VPN_REPORT_AUTH_REJECTED_CODE
+                    );
+                    let recovery = self.recover_vpn_report_auth(conf).await;
+                    if recovery.is_ok() {
+                        log::info!("VPN report authentication recovered after token resync");
+                    }
+                    recovery
+                }
+                result => result,
+            };
+            match report_result {
                 Ok(_) => (),
                 Err(err) => {
                     log::warn!("keep alive error: {}", err);
@@ -1641,11 +1708,11 @@ impl Client {
             .await?;
         match resp.code {
             0 => Ok(()),
-            _ => bail!(format!(
-                "failed to report connection with error {}: {}",
-                resp.code,
-                resp.message.unwrap_or_default()
-            )),
+            code => Err(VpnReportRejected {
+                code,
+                message: resp.message.unwrap_or_default(),
+            }
+            .into()),
         }
     }
 
@@ -2197,6 +2264,80 @@ mod tests {
             assert!(request.contains("&timestamp="));
             assert!(request_header(request, sign::SIGN_HEADER).is_none());
         }
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vpn_report_auth_recovery_refreshes_and_aligns_data_plane_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (requests_tx, requests_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+
+            let (mut list_stream, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut list_stream).await);
+            let list_body = r#"{"code":0,"data":[]}"#;
+            let list_response = format!(
+                "HTTP/1.1 200 OK\r\nSet-Cookie: vpn-token=token-b; Path=/\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{list_body}",
+                list_body.len()
+            );
+            list_stream.write_all(list_response.as_bytes()).await.unwrap();
+
+            let (mut report_stream, _) = listener.accept().await.unwrap();
+            requests.push(read_request(&mut report_stream).await);
+            let report_body = r#"{"code":0,"data":{}}"#;
+            let report_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{report_body}",
+                report_body.len()
+            );
+            report_stream
+                .write_all(report_response.as_bytes())
+                .await
+                .unwrap();
+
+            requests_tx.send(requests).unwrap();
+        });
+
+        let endpoint_url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        let mut client = test_client();
+        client.conf.server = Some(endpoint_url.as_str().trim_end_matches('/').to_string());
+        client.api_url = ApiUrl::new(&client.conf).unwrap();
+        client.api_url.vpn_param.url = endpoint_url.as_str().trim_end_matches('/').to_string();
+        client
+            .cookie
+            .lock()
+            .unwrap()
+            .insert_raw(&RawCookie::new("vpn-token", "token-a"), &endpoint_url)
+            .unwrap();
+        client.vpn_jwt = Some("token-a".to_string());
+
+        let conf = WgConf {
+            address: "192.0.2.42/24".to_string(),
+            address6: String::new(),
+            peer_address: "192.0.2.1:80".to_string(),
+            mtu: 1280,
+            public_key: "client-public-key".to_string(),
+            private_key: "client-private-key".to_string(),
+            peer_key: "peer-public-key".to_string(),
+            allowed_ips: Vec::new(),
+            routes: Vec::new(),
+            dns: "192.0.2.53".to_string(),
+            vpn_ip: "192.0.2.42".to_string(),
+            protocol: 0,
+        };
+        client.recover_vpn_report_auth(&conf).await.unwrap();
+
+        let requests = requests_rx.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /api/vpn/list?"));
+        assert!(requests[1].starts_with("POST /vpn/report?"));
+        assert_eq!(request_header(&requests[1], "jwt-token"), Some("token-b"));
+        assert_eq!(
+            request_header(&requests[1], "cookie")
+                .and_then(|value| super::cookie_value(value, "vpn-token")),
+            Some("token-b")
+        );
         server_task.await.unwrap();
     }
 
