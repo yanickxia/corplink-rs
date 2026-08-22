@@ -170,8 +170,8 @@ RUST_LOG=debug ./corplink-rs config.json
   // optional Android HTTP identity. Missing fields keep the current defaults.
   // This does not regenerate device_id or WireGuard keys.
   "android_profile": {
-    "app_version": "3.2.16",
-    "build_number": "2008",
+    "app_version": "3.3.16",
+    "build_number": "2279",
     "brand": "samsung",
     "model": "SM-S9210",
     "android_release": "14",
@@ -279,7 +279,7 @@ to be present:
 It produces this User-Agent:
 
 ```text
-CorpLink/3.2.16 (samsung SM-S9210; Android 14; en)
+CorpLink/3.3.16 (samsungSM-S9210; Android 14; en)
 ```
 
 ## SOCKS5 / netstack 模式
