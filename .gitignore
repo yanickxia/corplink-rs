@@ -21,3 +21,7 @@ libwg/libwg.h
 # release artifacts
 /release/
 *.zip
+
+# local TLS capture output and Python bytecode
+/capture.*
+__pycache__/
