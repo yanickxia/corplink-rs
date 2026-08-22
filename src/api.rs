@@ -192,7 +192,7 @@ mod tests {
 
         let api_url = ApiUrl::new(&conf).unwrap();
 
-        let query = "os_version_patch=2021-01-05&os=Android&app_version=3.2.16&os_version=30&build_number=2008&model=Phone&language=en&client_source=FeiLian&brand=Genymotion";
+        let query = "os_version_patch=2018-01-05&os=Android&app_version=3.3.16&os_version=27&build_number=2279&model=Android SDK built for arm64&language=en&client_source=FeiLian&brand=Android";
         assert_eq!(
             api_url.get_api_url(&ApiName::ListVPN),
             format!("https://vpn.example.com/api/vpn/list?{query}")
@@ -209,7 +209,7 @@ mod tests {
         .unwrap();
         let mut api_url = ApiUrl::new(&conf).unwrap();
         api_url.vpn_param.url = "https://192.0.2.1:8443".to_string();
-        let query = "os_version_patch=2021-01-05&os=Android&app_version=3.2.16&os_version=30&build_number=2008&model=Phone&language=en&client_source=FeiLian&brand=Genymotion";
+        let query = "os_version_patch=2018-01-05&os=Android&app_version=3.3.16&os_version=27&build_number=2279&model=Android SDK built for arm64&language=en&client_source=FeiLian&brand=Android";
 
         assert_eq!(
             api_url.get_api_url(&ApiName::PingVPN),
@@ -241,7 +241,7 @@ mod tests {
         }))
         .unwrap();
         let mut api_url = ApiUrl::new(&conf).unwrap();
-        let query = "os_version_patch=2025-04-01&os=Android&app_version=3.2.16&os_version=34&build_number=2008&model=SM-S9210&language=en&client_source=FeiLian&brand=samsung";
+        let query = "os_version_patch=2025-04-01&os=Android&app_version=3.3.16&os_version=34&build_number=2279&model=SM-S9210&language=en&client_source=FeiLian&brand=samsung";
 
         assert_eq!(
             api_url.get_api_url(&ApiName::ListVPN),

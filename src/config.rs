@@ -9,17 +9,18 @@ use crate::utils;
 
 const DEFAULT_DEVICE_NAME: &str = "DollarOS";
 const DEFAULT_INTERFACE_NAME: &str = "corplink";
-pub(crate) const CORPLINK_ANDROID_APP_VERSION: &str = "3.2.16";
+pub(crate) const CORPLINK_ANDROID_APP_VERSION: &str = "3.3.16";
 
-const DEFAULT_ANDROID_BUILD_NUMBER: &str = "2008";
-const DEFAULT_ANDROID_BRAND: &str = "Genymotion";
-const DEFAULT_ANDROID_MODEL: &str = "Phone";
-const DEFAULT_ANDROID_RELEASE: &str = "11";
-const DEFAULT_ANDROID_SDK: &str = "30";
-const DEFAULT_ANDROID_PATCH: &str = "2021-01-05";
+const DEFAULT_ANDROID_BUILD_NUMBER: &str = "2279";
+const DEFAULT_ANDROID_BRAND: &str = "Android";
+const DEFAULT_ANDROID_MODEL: &str = "Android SDK built for arm64";
+const DEFAULT_ANDROID_RELEASE: &str = "8.1.0";
+const DEFAULT_ANDROID_SDK: &str = "27";
+const DEFAULT_ANDROID_PATCH: &str = "2018-01-05";
 const DEFAULT_ANDROID_LANGUAGE: &str = "en";
 const DEFAULT_ANDROID_CLIENT_SOURCE: &str = "FeiLian";
-const LEGACY_ANDROID_USER_AGENT: &str = "CorpLink/3.2.16 (GenymotionPhone; Android 11; en)";
+const DEFAULT_ANDROID_USER_AGENT: &str =
+    "CorpLink/3.3.16 (AndroidAndroid SDK built for arm64; Android 8.1.0; en)";
 
 pub const PLATFORM_LDAP: &str = "ldap";
 pub const PLATFORM_CORPLINK: &str = "feilian";
@@ -97,8 +98,11 @@ impl Default for AndroidProfile {
 
 impl AndroidProfile {
     pub fn user_agent(&self) -> String {
+        // The Android client concatenates brand and model directly. Its current
+        // emulator identity is `AndroidAndroid SDK built for arm64`, without an
+        // extra separator, while the query string still carries them separately.
         format!(
-            "CorpLink/{} ({} {}; Android {}; {})",
+            "CorpLink/{} ({}{}; Android {}; {})",
             self.app_version, self.brand, self.model, self.android_release, self.language
         )
     }
@@ -184,9 +188,7 @@ impl Config {
         self.android_profile
             .as_ref()
             .map(AndroidProfile::user_agent)
-            // Preserve the exact historical Rust UA unless the user opts in
-            // to a configurable Android profile.
-            .unwrap_or_else(|| LEGACY_ANDROID_USER_AGENT.to_string())
+            .unwrap_or_else(|| DEFAULT_ANDROID_USER_AGENT.to_string())
     }
 
     pub async fn from_file(file: &str) -> Result<Config> {
@@ -260,7 +262,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_android_profile_preserves_legacy_identity() {
+    fn missing_android_profile_uses_current_official_identity() {
         let conf: Config = serde_json::from_value(json!({
             "company_name": "test",
             "username": "test"
@@ -270,7 +272,7 @@ mod tests {
         assert!(conf.android_profile.is_none());
         assert_eq!(
             conf.android_user_agent(),
-            "CorpLink/3.2.16 (GenymotionPhone; Android 11; en)"
+            "CorpLink/3.3.16 (AndroidAndroid SDK built for arm64; Android 8.1.0; en)"
         );
         assert_eq!(conf.effective_android_profile(), AndroidProfile::default());
     }
@@ -292,12 +294,12 @@ mod tests {
         .unwrap();
 
         let profile = conf.effective_android_profile();
-        assert_eq!(profile.app_version, "3.2.16");
-        assert_eq!(profile.build_number, "2008");
+        assert_eq!(profile.app_version, "3.3.16");
+        assert_eq!(profile.build_number, "2279");
         assert_eq!(profile.client_source, "FeiLian");
         assert_eq!(
             conf.android_user_agent(),
-            "CorpLink/3.2.16 (samsung SM-S9210; Android 14; en)"
+            "CorpLink/3.3.16 (samsungSM-S9210; Android 14; en)"
         );
         assert_eq!(conf.device_id.as_deref(), Some("stable-device-id"));
     }
