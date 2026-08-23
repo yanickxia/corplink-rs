@@ -60,15 +60,13 @@ pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const ETIMEDOUT: i32 = 110;
 
-async fn wait_for_tunnel_exit<S, H, W>(shutdown: S, heartbeat: H, handshake: W) -> i32
+async fn wait_for_tunnel_exit<S, W>(shutdown: S, handshake: W) -> i32
 where
     S: std::future::Future<Output = ()>,
-    H: std::future::Future<Output = ()>,
     W: std::future::Future<Output = ()>,
 {
     tokio::select! {
         _ = shutdown => 0,
-        _ = heartbeat => ETIMEDOUT,
         _ = handshake => ETIMEDOUT,
     }
 }
@@ -203,14 +201,13 @@ async fn run() -> Result<()> {
         }
     }
 
-    let exit_code = wait_for_tunnel_exit(
-        wait_for_shutdown_signal(),
-        c.keep_alive_vpn(&wg_conf, 60),
-        async {
-            uapi.check_wg_connection().await;
-            log::warn!("last handshake timeout");
-        },
-    )
+    // `/vpn/report` is control-plane telemetry, not tunnel liveness. The actual
+    // tunnel already has WireGuard persistent keepalive configured; only stop on
+    // an explicit shutdown or when the WireGuard handshake monitor expires.
+    let exit_code = wait_for_tunnel_exit(wait_for_shutdown_signal(), async {
+        uapi.check_wg_connection().await;
+        log::warn!("last handshake timeout");
+    })
     .await;
 
     // shutdown
@@ -314,22 +311,15 @@ mod tests {
     use super::{wait_for_tunnel_exit, ETIMEDOUT};
 
     #[tokio::test]
-    async fn heartbeat_completion_requests_tunnel_restart() {
-        let exit_code = wait_for_tunnel_exit(pending(), ready(()), pending()).await;
-
-        assert_eq!(exit_code, ETIMEDOUT);
-    }
-
-    #[tokio::test]
     async fn shutdown_completion_exits_cleanly() {
-        let exit_code = wait_for_tunnel_exit(ready(()), pending(), pending()).await;
+        let exit_code = wait_for_tunnel_exit(ready(()), pending()).await;
 
         assert_eq!(exit_code, 0);
     }
 
     #[tokio::test]
     async fn handshake_completion_requests_tunnel_restart() {
-        let exit_code = wait_for_tunnel_exit(pending(), pending(), ready(())).await;
+        let exit_code = wait_for_tunnel_exit(pending(), ready(())).await;
 
         assert_eq!(exit_code, ETIMEDOUT);
     }
