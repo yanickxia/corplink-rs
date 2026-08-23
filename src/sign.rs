@@ -149,8 +149,8 @@ pub(crate) fn compute_sign(
 /// 返回该 path 对应的签名 mask；不在表中的 path 不签名（返回 None）。
 /// 网关端点（/api/*、/vpn/ping）用 0x1fe（含 cookie+csrf）；数据面 /vpn/conn 用 0x21e
 /// （bits 1,2,3,4,9 = method/path/query/bodyHash/jwtToken，无 cookie/csrf），jwt 取自 vpn-token cookie。
-/// **/vpn/report（心跳/断连上报）不签名**：真机抓包证实其只带 cookie+csrf+jwt-token 头、无 Sign 头，
-/// 若给它加 Sign 头会被服务端拒（code 1000）。以上均经真机抓包验证。
+/// **/vpn/report（退出时的断连通知）不签名**：真机抓包证实其只带
+/// cookie+csrf+jwt-token 头、无 Sign 头。以上均经真机抓包验证。
 pub(crate) fn sign_mask_by_path(path: &str) -> Option<u64> {
     match path {
         "/api/vpn/list" => Some(0x1fe),
@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(sign_mask_by_path("/api/vpn/list"), Some(0x1fe));
         assert_eq!(sign_mask_by_path("/vpn/ping"), Some(0x1fe));
         assert_eq!(sign_mask_by_path("/vpn/conn"), Some(0x21e));
-        assert_eq!(sign_mask_by_path("/vpn/report"), None); // 心跳/断连上报不签名
+        assert_eq!(sign_mask_by_path("/vpn/report"), None); // 断连通知不签名
         assert_eq!(sign_mask_by_path("/api/device/report"), Some(0x1fe));
         assert_eq!(sign_mask_by_path("/api/emgr/device/report"), Some(0x1fe));
         assert_eq!(sign_mask_by_path("/api/login"), None);
