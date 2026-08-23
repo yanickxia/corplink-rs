@@ -34,25 +34,6 @@ use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
 const SIGN_RETRY_CODES: [i32; 2] = [11020001, 11020002];
-const VPN_REPORT_AUTH_REJECTED_CODE: i32 = 1000;
-
-#[derive(Debug)]
-struct VpnReportRejected {
-    code: i32,
-    message: String,
-}
-
-impl fmt::Display for VpnReportRejected {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "failed to report connection with error {}: {}",
-            self.code, self.message
-        )
-    }
-}
-
-impl std::error::Error for VpnReportRejected {}
 
 fn cookie_value<'a>(cookie_header: &'a str, expected_name: &str) -> Option<&'a str> {
     cookie_header
@@ -161,9 +142,6 @@ pub struct Client {
     probe_client: reqwest::Client,
     api_url: ApiUrl,
     date_offset_sec: i32,
-    /// 数据面 `jwt-token` 请求头。它作为 Cookie 缺失时的兜底；正常请求优先
-    /// 使用当前数据面 `vpn-token` Cookie，保持二者立即对齐。
-    vpn_jwt: Option<String>,
 }
 
 struct VpnProbeResponse {
@@ -273,7 +251,6 @@ impl Client {
             probe_client,
             api_url: ApiUrl::new(&conf_bak)?,
             date_offset_sec: 0,
-            vpn_jwt: None,
         })
     }
 
@@ -343,9 +320,8 @@ impl Client {
             let mut url = Url::from_str(&url_str)
                 .with_context(|| format!("invalid api url {url_str} for {api:?}"))?;
 
-            // timestamp（秒）加入 query：签名端点需要它进签名；数据面 /vpn/report（心跳/断连
-            // 上报，不签名）也必须带 timestamp——服务端据此防重放，缺失会导致连续相同请求被判重放
-            // 而返回 code 1000。真机客户端所有 /vpn/* 与 /api/* 请求均带 timestamp。
+            // timestamp（秒）加入 query：签名端点需要它参与签名；退出时的
+            // /vpn/report 断连通知也需要 timestamp 防重放。
             let needs_timestamp =
                 sign::sign_mask_by_path(url.path()).is_some() || url.path() == "/vpn/report";
             if needs_timestamp {
@@ -360,13 +336,10 @@ impl Client {
             let csrf = cookie_value(&cookie_str, "csrf-token")
                 .unwrap_or("")
                 .to_owned();
-            let cookie_jwt = cookie_value(&cookie_str, "vpn-token").map(str::to_owned);
             let is_data_plane = matches!(url.path(), "/vpn/conn" | "/vpn/report");
-            let request_jwt = if is_data_plane {
-                cookie_jwt.clone().or_else(|| self.vpn_jwt.clone())
-            } else {
-                cookie_jwt.clone()
-            };
+            let request_jwt = is_data_plane
+                .then(|| cookie_value(&cookie_str, "vpn-token").map(str::to_owned))
+                .flatten();
             let sign_header = self.build_sign_header_with_cookie(
                 method,
                 &url,
@@ -391,8 +364,8 @@ impl Client {
             if !cookie_str.is_empty() {
                 rb = rb.header(header::COOKIE, &cookie_str);
             }
-            // 数据面优先使用当前 Cookie 中的 vpn-token；vpn_jwt 只在 Cookie
-            // 缺失时兜底，避免构造出新 Cookie + 旧请求头的混合状态。
+            // 数据面的签名与 jwt-token 头始终来自同一份当前 Cookie，避免
+            // 维护第二份可过期的 token 状态。
             if let Some(jwt) = request_jwt.as_deref() {
                 rb = rb.header("jwt-token", jwt);
             }
@@ -430,16 +403,6 @@ impl Client {
             let raw: Resp<Value> = serde_json::from_str(&text).with_context(|| {
                 format!("failed to parse response envelope for api {api:?}: {text}")
             })?;
-
-            // 当前真机时序要求 jwt-token 与最新 vpn-token Cookie 保持一致。
-            // reqwest 在这里已经处理了响应 Set-Cookie，因此成功后从 CookieStore
-            // 重新读取，供 Cookie 缺失时兜底。
-            if raw.code == 0 && url.path() == "/vpn/report" {
-                let latest_cookie = self.cookie_header_for(&url)?;
-                if let Some(latest_jwt) = cookie_value(&latest_cookie, "vpn-token") {
-                    self.vpn_jwt = Some(latest_jwt.to_owned());
-                }
-            }
 
             // 签名时间戳过期错误：刷新后重试一次
             if attempt == 0 && SIGN_RETRY_CODES.contains(&raw.code) {
@@ -1114,9 +1077,9 @@ impl Client {
     }
 
     fn sync_gateway_cookies_to_endpoint(&self, url: &Url) -> Result<()> {
-        // 把网关域(server)的会话 cookie 复制到数据面 IP host，使随后 /vpn/conn、/vpn/report
-        // 请求在该 host 上带上 session/csrf/vpn-token（这些是网关域 HostOnly cookie，不会自动
-        // 匹配数据面 IP host）。
+        // 把网关域(server)的会话 cookie 复制到数据面 IP host，使随后 /vpn/conn
+        // 和退出时的断连通知在该 host 上带上 session/csrf/vpn-token（这些是网关域
+        // HostOnly cookie，不会自动匹配数据面 IP host）。
         {
             let mut cookie_store = self
                 .cookie
@@ -1152,44 +1115,6 @@ impl Client {
         self.sync_gateway_cookies_to_endpoint(&url)?;
         self.api_url.vpn_param.url = url.to_string().trim_end_matches('/').to_string();
         Ok(url)
-    }
-
-    async fn refresh_vpn_token(&mut self) -> Result<()> {
-        let endpoint_url = Url::from_str(&self.api_url.vpn_param.url)
-            .context("invalid active VPN endpoint URL")?;
-
-        // 当前 Android 客户端会把控制面更新后的完整 Cookie 会话交给 VPN
-        // 进程使用。vpn-token 与 session/csrf-token 必须作为同一快照同步，
-        // 否则会形成“新 token + 旧 session”的无效组合。
-        self.list_vpn().await?;
-        self.sync_gateway_cookies_to_endpoint(&endpoint_url)?;
-        self.align_vpn_jwt_to_endpoint_cookie()?;
-        Ok(())
-    }
-
-    fn align_vpn_jwt_to_endpoint_cookie(&mut self) -> Result<()> {
-        let endpoint_url = Url::from_str(&self.api_url.vpn_param.url)
-            .context("invalid active VPN endpoint URL")?;
-        let endpoint_cookie = self.cookie_header_for(&endpoint_url)?;
-        let vpn_token = cookie_value(&endpoint_cookie, "vpn-token")
-            .context("VPN endpoint vpn-token missing while aligning report authentication")?;
-        self.vpn_jwt = Some(vpn_token.to_owned());
-        Ok(())
-    }
-
-    async fn recover_vpn_report_auth(&mut self, conf: &WgConf) -> Result<()> {
-        // code 1000 可能是刷新窗口边缘上的 Cookie/jwt-token 不同步。先从
-        // 控制面取得完整的新会话快照，再让数据面的两个 token 立即对齐。
-        self.refresh_vpn_token()
-            .await
-            .context("failed to refresh VPN token during report recovery")?;
-
-        // /vpn/report 使用秒级 timestamp。避免恢复请求和刚失败的请求落在同一秒，
-        // 被服务端继续当成重放。
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        self.report_vpn_status(conf)
-            .await
-            .context("VPN report retry after token resync failed")
     }
 
     // ping vpn and return latency in ms. Will return Err on error
@@ -1408,10 +1333,8 @@ impl Client {
             &mut selected_vpn.set_cookie_headers.iter(),
             &endpoint_url,
         );
-        // `/vpn/conn` 和后续 `/vpn/report` 都从选中节点当前的 vpn-token
-        // 起步，并保持 Cookie 与 jwt-token 立即对齐。
-        let endpoint_cookie = self.cookie_header_for(&endpoint_url)?;
-        self.vpn_jwt = cookie_value(&endpoint_cookie, "vpn-token").map(str::to_owned);
+        // `/vpn/conn` 的签名和 jwt-token 请求头都直接使用选中节点当前的
+        // vpn-token Cookie，不再维护第二份 token 快照。
         self.save_cookie()?;
         let vpn_addr = match vpn.ip.parse::<IpAddr>() {
             Ok(ip) => SocketAddr::new(ip, vpn.vpn_port).to_string(),
@@ -1623,45 +1546,7 @@ impl Client {
         Ok(wg_conf)
     }
 
-    pub async fn keep_alive_vpn(&mut self, conf: &WgConf, interval: u64) {
-        loop {
-            log::info!("keep alive");
-            // Do not rotate vpn-token on a live tunnel. Android keeps the
-            // token selected by /vpn/conn; replacing it with a later /vpn/list
-            // token makes the server detach reports from the existing peer.
-            // A refresh is attempted only after an explicit authentication
-            // rejection below, followed by a reconnect if recovery fails.
-            let report_result = match self.report_vpn_status(conf).await {
-                Err(err)
-                    if err
-                        .downcast_ref::<VpnReportRejected>()
-                        .is_some_and(|rejected| rejected.code == VPN_REPORT_AUTH_REJECTED_CODE) =>
-                {
-                    log::warn!(
-                        "VPN report authentication rejected (code {}), refreshing token and retrying once",
-                        VPN_REPORT_AUTH_REJECTED_CODE
-                    );
-                    let recovery = self.recover_vpn_report_auth(conf).await;
-                    if recovery.is_ok() {
-                        log::info!("VPN report authentication recovered after token resync");
-                    }
-                    recovery
-                }
-                result => result,
-            };
-            match report_result {
-                Ok(_) => (),
-                Err(err) => {
-                    log::warn!("keep alive error: {}", err);
-                    return;
-                }
-            }
-
-            tokio::time::sleep(Duration::from_secs(interval)).await;
-        }
-    }
-
-    fn vpn_report_body(&self, conf: &WgConf, report_type: &str) -> Map<String, Value> {
+    fn vpn_disconnect_body(&self, conf: &WgConf) -> Map<String, Value> {
         let mut m = Map::new();
         m.insert("ip".to_string(), json!(&conf.vpn_ip));
         m.insert("public_key".to_string(), json!(conf.public_key));
@@ -1672,27 +1557,12 @@ impl Client {
                 crate::config::RouteMode::Full => "Full",
             }),
         );
-        m.insert("type".to_string(), json!(report_type));
+        m.insert("type".to_string(), json!("101"));
         m
     }
 
-    pub async fn report_vpn_status(&mut self, conf: &WgConf) -> Result<()> {
-        let m = self.vpn_report_body(conf, "100");
-        let resp = self
-            .request::<Map<String, Value>>(ApiName::KeepAliveVPN, Some(m))
-            .await?;
-        match resp.code {
-            0 => Ok(()),
-            code => Err(VpnReportRejected {
-                code,
-                message: resp.message.unwrap_or_default(),
-            }
-            .into()),
-        }
-    }
-
     pub async fn disconnect_vpn(&mut self, wg_conf: &WgConf) -> Result<()> {
-        let m = self.vpn_report_body(wg_conf, "101");
+        let m = self.vpn_disconnect_body(wg_conf);
         let resp = self
             .request::<Map<String, Value>>(ApiName::DisconnectVPN, Some(m))
             .await?;
@@ -1752,7 +1622,7 @@ mod tests {
     use cookie_store::CookieStore;
     use reqwest::{ClientBuilder, Url};
     use reqwest_cookie_store::CookieStoreMutex;
-    use serde_json::{json, Map, Value};
+    use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::{oneshot, Barrier};
@@ -1887,31 +1757,6 @@ mod tests {
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nDate: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     httpdate::fmt_http_date(server_time),
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-            requests_tx.send(requests).unwrap();
-        });
-        (port, requests_rx, task)
-    }
-
-    async fn start_report_server() -> (
-        u16,
-        oneshot::Receiver<Vec<String>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (requests_tx, requests_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for _ in 0..3 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                requests.push(read_request(&mut stream).await);
-                let body = r#"{"code":0,"data":{}}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
@@ -2205,174 +2050,6 @@ mod tests {
         server_task.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn vpn_report_jwt_header_tracks_current_cookie_token() {
-        let (port, requests_rx, server_task) = start_report_server().await;
-        let endpoint_url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
-        let mut client = test_client();
-        client.api_url.vpn_param.url = endpoint_url.as_str().trim_end_matches('/').to_string();
-        {
-            let mut store = client.cookie.lock().unwrap();
-            store
-                .insert_raw(&RawCookie::new("vpn-token", "token-a"), &endpoint_url)
-                .unwrap();
-        }
-        client.vpn_jwt = Some("token-a".to_string());
-
-        client
-            .request::<Map<String, Value>>(ApiName::KeepAliveVPN, Some(Map::new()))
-            .await
-            .unwrap();
-        {
-            let mut store = client.cookie.lock().unwrap();
-            store
-                .insert_raw(&RawCookie::new("vpn-token", "token-b"), &endpoint_url)
-                .unwrap();
-        }
-        client
-            .request::<Map<String, Value>>(ApiName::KeepAliveVPN, Some(Map::new()))
-            .await
-            .unwrap();
-        client
-            .request::<Map<String, Value>>(ApiName::KeepAliveVPN, Some(Map::new()))
-            .await
-            .unwrap();
-
-        let requests = requests_rx.await.unwrap();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(request_header(&requests[0], "jwt-token"), Some("token-a"));
-        assert_eq!(
-            request_header(&requests[0], "cookie")
-                .and_then(|value| super::cookie_value(value, "vpn-token")),
-            Some("token-a")
-        );
-        assert_eq!(request_header(&requests[1], "jwt-token"), Some("token-b"));
-        assert_eq!(
-            request_header(&requests[1], "cookie")
-                .and_then(|value| super::cookie_value(value, "vpn-token")),
-            Some("token-b")
-        );
-        assert_eq!(request_header(&requests[2], "jwt-token"), Some("token-b"));
-        assert_eq!(
-            request_header(&requests[2], "cookie")
-                .and_then(|value| super::cookie_value(value, "vpn-token")),
-            Some("token-b")
-        );
-        for request in &requests {
-            assert!(request.starts_with("POST /vpn/report?"));
-            assert!(request.contains("&timestamp="));
-            assert!(request_header(request, sign::SIGN_HEADER).is_none());
-        }
-        server_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn vpn_report_auth_recovery_refreshes_and_aligns_data_plane_token() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (requests_tx, requests_rx) = oneshot::channel();
-        let server_task = tokio::spawn(async move {
-            let mut requests = Vec::new();
-
-            let (mut list_stream, _) = listener.accept().await.unwrap();
-            requests.push(read_request(&mut list_stream).await);
-            let list_body = r#"{"code":0,"data":[]}"#;
-            let list_response = format!(
-                "HTTP/1.1 200 OK\r\nSet-Cookie: vpn-token=token-b; Path=/\r\nSet-Cookie: session=control-session-b; Path=/\r\nSet-Cookie: csrf-token=control-csrf-b; Path=/\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{list_body}",
-                list_body.len()
-            );
-            list_stream
-                .write_all(list_response.as_bytes())
-                .await
-                .unwrap();
-
-            let (mut report_stream, _) = listener.accept().await.unwrap();
-            requests.push(read_request(&mut report_stream).await);
-            let report_body = r#"{"code":0,"data":{}}"#;
-            let report_response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{report_body}",
-                report_body.len()
-            );
-            report_stream
-                .write_all(report_response.as_bytes())
-                .await
-                .unwrap();
-
-            requests_tx.send(requests).unwrap();
-        });
-
-        let gateway_url = Url::parse(&format!("http://localhost:{port}")).unwrap();
-        let endpoint_url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
-        let mut client = test_client();
-        client.conf.server = Some(gateway_url.as_str().trim_end_matches('/').to_string());
-        client.api_url = ApiUrl::new(&client.conf).unwrap();
-        client.api_url.vpn_param.url = endpoint_url.as_str().trim_end_matches('/').to_string();
-        {
-            let mut store = client.cookie.lock().unwrap();
-            store
-                .insert_raw(&RawCookie::new("vpn-token", "token-a"), &gateway_url)
-                .unwrap();
-            store
-                .insert_raw(&RawCookie::new("session", "control-session-a"), &gateway_url)
-                .unwrap();
-            store
-                .insert_raw(&RawCookie::new("csrf-token", "control-csrf-a"), &gateway_url)
-                .unwrap();
-            store
-                .insert_raw(&RawCookie::new("vpn-token", "token-a"), &endpoint_url)
-                .unwrap();
-            store
-                .insert_raw(&RawCookie::new("session", "data-session-a"), &endpoint_url)
-                .unwrap();
-            store
-                .insert_raw(&RawCookie::new("csrf-token", "data-csrf-a"), &endpoint_url)
-                .unwrap();
-        }
-        client.vpn_jwt = Some("token-a".to_string());
-
-        let conf = WgConf {
-            address: "192.0.2.42/24".to_string(),
-            address6: String::new(),
-            peer_address: "192.0.2.1:80".to_string(),
-            mtu: 1280,
-            public_key: "client-public-key".to_string(),
-            private_key: "client-private-key".to_string(),
-            peer_key: "peer-public-key".to_string(),
-            allowed_ips: Vec::new(),
-            routes: Vec::new(),
-            dns: "192.0.2.53".to_string(),
-            vpn_ip: "192.0.2.42".to_string(),
-            protocol: 0,
-        };
-        client.recover_vpn_report_auth(&conf).await.unwrap();
-
-        let requests = requests_rx.await.unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with("GET /api/vpn/list?"));
-        assert!(requests[1].starts_with("POST /vpn/report?"));
-        assert_eq!(request_header(&requests[1], "jwt-token"), Some("token-b"));
-        assert_eq!(
-            request_header(&requests[1], "csrf-token"),
-            Some("control-csrf-b")
-        );
-        assert_eq!(
-            request_header(&requests[1], "cookie")
-                .and_then(|value| super::cookie_value(value, "vpn-token")),
-            Some("token-b")
-        );
-        assert_eq!(
-            request_header(&requests[1], "cookie")
-                .and_then(|value| super::cookie_value(value, "session")),
-            Some("control-session-b")
-        );
-        assert_eq!(
-            request_header(&requests[1], "cookie")
-                .and_then(|value| super::cookie_value(value, "csrf-token")),
-            Some("control-csrf-b")
-        );
-        server_task.await.unwrap();
-    }
-
     #[test]
     fn vpn_endpoint_urls_use_server_scheme_and_candidate_host() {
         let mut client = test_client();
@@ -2398,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshing_vpn_token_replaces_data_plane_cookie_snapshot() {
+    fn syncing_gateway_cookies_replaces_data_plane_snapshot() {
         let mut client = test_client();
         let gateway_url = Url::parse("http://gateway.example").unwrap();
         let endpoint_url = Url::parse("http://192.0.2.1").unwrap();
@@ -2446,7 +2123,7 @@ mod tests {
     }
 
     #[test]
-    fn vpn_report_body_uses_raw_assigned_ip() {
+    fn vpn_disconnect_body_uses_raw_assigned_ip() {
         let client = test_client();
         let conf = WgConf {
             address: "192.0.2.42/24".to_string(),
@@ -2464,12 +2141,12 @@ mod tests {
         };
 
         assert_eq!(
-            client.vpn_report_body(&conf, "100"),
+            client.vpn_disconnect_body(&conf),
             json!({
                 "ip": "192.0.2.42",
                 "mode": "Split",
                 "public_key": "client-public-key",
-                "type": "100"
+                "type": "101"
             })
             .as_object()
             .unwrap()
@@ -2547,7 +2224,6 @@ mod tests {
             c,
             api_url,
             date_offset_sec: 0,
-            vpn_jwt: None,
         }
     }
 
