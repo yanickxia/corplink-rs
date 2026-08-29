@@ -3,6 +3,9 @@
 本文说明如何在 macOS + 已 Root 的 Android/Genymotion 环境中，使用
 Frida 和 [`httpdump.py`](./httpdump.py) 抓取 CorpLink 的 HTTPS 控制流量。
 
+社区 `corplink-web` 镜像的隧道探测、transport repair 和完整重建机制记录在
+[`corplink-web-recovery.md`](./corplink-web-recovery.md)。
+
 请只分析你有权测试的设备、应用和账号。抓取结果可能包含登录态、Cookie、
 令牌、内部地址和 VPN 配置，应按敏感数据处理。
 
