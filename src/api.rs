@@ -7,7 +7,8 @@ use crate::config::Config;
 use crate::template::Template;
 
 pub const URL_GET_COMPANY: &str = "https://corplink.volcengine.cn/api/match";
-pub(crate) const CORPLINK_APP_VERSION: &str = "201000";
+pub(crate) const CORPLINK_APP_VERSION: &str = "3.3.17";
+pub(crate) const CORPLINK_BUILD_NUMBER: &str = "8135";
 
 const URL_GET_LOGIN_METHOD: &str = "{{url}}/api/login/setting?os={{os}}&os_version={{version}}";
 const URL_GET_TPS_LOGIN_METHOD: &str = "{{url}}/api/tpslogin/link?os={{os}}&os_version={{version}}";
@@ -19,13 +20,12 @@ const URL_VERIFY_CODE: &str = "{{url}}/api/login/code/verify?os={{os}}&os_versio
 const URL_LOGIN_PASSWORD: &str = "{{url}}/api/login?os={{os}}&os_version={{version}}";
 const URL_LOGIN_PASSWORD_V1: &str =
     "{{url}}/api/v1/login?os={{os}}&os_version={{version}}&client_source=FeiLian";
-const URL_LIST_VPN: &str = "{{url}}/api/vpn/list?os_version_patch={{os_version_patch}}&os={{os}}&app_version={{app_version}}&os_version={{os_version}}&build_number={{build_number}}&model={{model}}&language={{language}}&client_source={{client_source}}&brand={{brand}}";
-
-// 数据面参数需和当前安卓客户端逐项、逐序一致；/vpn/conn 的 query
-// 还会参与签名计算，心跳也应保持同一份客户端身份。
-const URL_PING_VPN_HOST: &str = "{{url}}/vpn/ping?os_version_patch={{os_version_patch}}&os={{os}}&app_version={{app_version}}&os_version={{os_version}}&build_number={{build_number}}&model={{model}}&language={{language}}&client_source={{client_source}}&brand={{brand}}";
-const URL_FETCH_PEER_INFO: &str = "{{url}}/vpn/conn?os_version_patch={{os_version_patch}}&os={{os}}&app_version={{app_version}}&os_version={{os_version}}&build_number={{build_number}}&model={{model}}&language={{language}}&client_source={{client_source}}&brand={{brand}}";
-const URL_OPERATE_VPN: &str = "{{url}}/vpn/report?os_version_patch={{os_version_patch}}&os={{os}}&app_version={{app_version}}&os_version={{os_version}}&build_number={{build_number}}&model={{model}}&language={{language}}&client_source={{client_source}}&brand={{brand}}";
+// Match the community Linux client lifecycle. The request layer appends the
+// corrected timestamp to the two signed endpoints after rendering these fields.
+const URL_LIST_VPN: &str = "{{url}}/api/vpn/list?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_release={{os_release}}&os_version={{version}}&soc={{soc}}";
+const URL_PING_VPN_HOST: &str = "{{url}}/vpn/ping?os={{os}}&os_version={{version}}";
+const URL_FETCH_PEER_INFO: &str = "{{url}}/vpn/conn?app_version={{app_version}}&brand={{brand}}&build_number={{build_number}}&client_source={{client_source}}&language={{language}}&model={{model}}&os={{os}}&os_release={{os_release}}&os_version={{version}}&soc={{soc}}";
+const URL_OPERATE_VPN: &str = "{{url}}/vpn/report?os={{os}}&os_version={{version}}";
 const URL_OTP: &str = "{{url}}/api/v2/p/otp?os={{os}}&os_version={{version}}";
 // log out the current terminal so it frees the server-side session/terminal
 // quota. logout_all=false only signs out this device. responds with a 302.
@@ -60,31 +60,87 @@ struct UserUrlParam {
 }
 
 #[derive(Clone, Serialize)]
+struct LinuxUrlParam {
+    url: String,
+    app_version: String,
+    brand: String,
+    build_number: String,
+    client_source: String,
+    language: String,
+    model: String,
+    os: String,
+    os_release: String,
+    version: String,
+    soc: String,
+}
+
+#[derive(Clone, Serialize)]
 pub struct VpnUrlParam {
     pub url: String,
     os: String,
-    os_version_patch: String,
-    app_version: String,
-    os_version: String,
-    build_number: String,
-    model: String,
-    language: String,
-    client_source: String,
-    brand: String,
+    version: String,
 }
 
 #[derive(Clone)]
 pub struct ApiUrl {
     user_param: UserUrlParam,
-    gateway_param: VpnUrlParam,
+    list_vpn_param: LinuxUrlParam,
     pub vpn_param: VpnUrlParam,
     api_template: HashMap<ApiName, Template>,
+}
+
+fn linux_os_release() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(release) = std::fs::read_to_string("/etc/os-release") {
+            for line in release.lines() {
+                if let Some(value) = line.strip_prefix("ID=") {
+                    return value.trim_matches('"').to_string();
+                }
+            }
+        }
+        "linux".to_string()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::consts::OS.to_string()
+    }
+}
+
+fn linux_os_version() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(release) = std::fs::read_to_string("/etc/os-release") {
+            for line in release.lines() {
+                if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
+                    return value.trim_matches('"').to_string();
+                }
+            }
+        }
+        "Linux".to_string()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::consts::OS.to_string()
+    }
+}
+
+fn cpu_soc() -> String {
+    match std::env::consts::ARCH {
+        "aarch64" => "aarch64".to_string(),
+        "x86_64" => "x86_64".to_string(),
+        arch => arch.to_string(),
+    }
 }
 
 impl ApiUrl {
     pub fn new(conf: &Config) -> Result<ApiUrl> {
         let os = "Android".to_string();
         let version = "2".to_string();
+        let server_url = conf
+            .server
+            .clone()
+            .context("server url missing in config")?;
         let mut api_template = HashMap::new();
 
         api_template.insert(ApiName::LoginMethod, Template::new(URL_GET_LOGIN_METHOD));
@@ -114,37 +170,31 @@ impl ApiUrl {
         api_template.insert(ApiName::Otp, Template::new(URL_OTP));
         api_template.insert(ApiName::Logout, Template::new(URL_LOGOUT));
 
-        let server_url = conf
-            .server
-            .clone()
-            .context("server url missing in config")?;
-        let android_profile = conf.effective_android_profile();
-        let gateway_param = VpnUrlParam {
-            url: server_url.clone(),
-            os: os.clone(),
-            os_version_patch: android_profile.os_version_patch,
-            app_version: android_profile.app_version,
-            os_version: android_profile.os_version,
-            build_number: android_profile.build_number,
-            model: android_profile.model,
-            language: android_profile.language,
-            client_source: android_profile.client_source,
-            brand: android_profile.brand,
-        };
-        let vpn_param = VpnUrlParam {
-            url: String::new(),
-            ..gateway_param.clone()
-        };
-
         Ok(ApiUrl {
             user_param: UserUrlParam {
-                url: server_url,
+                url: server_url.clone(),
                 os: os.clone(),
                 version: version.clone(),
                 app_version: CORPLINK_APP_VERSION.to_string(),
             },
-            gateway_param,
-            vpn_param,
+            list_vpn_param: LinuxUrlParam {
+                url: server_url,
+                app_version: CORPLINK_APP_VERSION.to_string(),
+                brand: String::new(),
+                build_number: CORPLINK_BUILD_NUMBER.to_string(),
+                client_source: "FeiLian".to_string(),
+                language: "en".to_string(),
+                model: String::new(),
+                os: "Linux".to_string(),
+                os_release: linux_os_release(),
+                version: linux_os_version(),
+                soc: cpu_soc(),
+            },
+            vpn_param: VpnUrlParam {
+                url: String::new(),
+                os,
+                version,
+            },
             api_template,
         })
     }
@@ -161,12 +211,16 @@ impl ApiUrl {
             ApiName::LoginEmail => self.api_template[name].render(user_param),
             ApiName::LoginPassword => self.api_template[name].render(user_param),
             ApiName::LoginPasswordV1 => self.api_template[name].render(user_param),
-            ApiName::ListVPN => self.api_template[name].render(&self.gateway_param),
+            ApiName::ListVPN => self.api_template[name].render(&self.list_vpn_param),
             ApiName::Otp => self.api_template[name].render(user_param),
             ApiName::Logout => self.api_template[name].render(user_param),
 
             ApiName::PingVPN => self.api_template[name].render(vpn_param),
-            ApiName::ConnectVPN => self.api_template[name].render(vpn_param),
+            ApiName::ConnectVPN => {
+                let mut param = self.list_vpn_param.clone();
+                param.url = self.vpn_param.url.clone();
+                self.api_template[name].render(&param)
+            }
             ApiName::DisconnectVPN => self.api_template[name].render(vpn_param),
         }
     }
@@ -179,7 +233,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signed_list_vpn_url_matches_current_android_parameter_order() {
+    fn list_vpn_url_matches_community_linux_shape() {
         let conf: Config = serde_json::from_value(json!({
             "company_name": "test",
             "username": "test",
@@ -189,15 +243,19 @@ mod tests {
 
         let api_url = ApiUrl::new(&conf).unwrap();
 
-        let query = "os_version_patch=2018-01-05&os=Android&app_version=3.3.16&os_version=27&build_number=2279&model=Android SDK built for arm64&language=en&client_source=FeiLian&brand=Android";
-        assert_eq!(
-            api_url.get_api_url(&ApiName::ListVPN),
-            format!("https://vpn.example.com/api/vpn/list?{query}")
-        );
+        let url = api_url.get_api_url(&ApiName::ListVPN);
+        assert!(url.starts_with("https://vpn.example.com/api/vpn/list?"));
+        assert!(url.contains("app_version=3.3.17"));
+        assert!(url.contains("build_number=8135"));
+        assert!(url.contains("client_source=FeiLian"));
+        assert!(url.contains("os=Linux"));
+        assert!(url.contains("os_release="));
+        assert!(url.contains("soc="));
+        assert!(!url.contains("timestamp="));
     }
 
     #[test]
-    fn vpn_data_plane_urls_match_current_android_parameter_order() {
+    fn vpn_urls_match_community_linux_lifecycle() {
         let conf: Config = serde_json::from_value(json!({
             "company_name": "test",
             "username": "test",
@@ -206,53 +264,19 @@ mod tests {
         .unwrap();
         let mut api_url = ApiUrl::new(&conf).unwrap();
         api_url.vpn_param.url = "https://192.0.2.1:8443".to_string();
-        let query = "os_version_patch=2018-01-05&os=Android&app_version=3.3.16&os_version=27&build_number=2279&model=Android SDK built for arm64&language=en&client_source=FeiLian&brand=Android";
-
         assert_eq!(
             api_url.get_api_url(&ApiName::PingVPN),
-            format!("https://192.0.2.1:8443/vpn/ping?{query}")
+            "https://192.0.2.1:8443/vpn/ping?os=Android&os_version=2"
         );
-        assert_eq!(
-            api_url.get_api_url(&ApiName::ConnectVPN),
-            format!("https://192.0.2.1:8443/vpn/conn?{query}")
-        );
-        assert_eq!(
-            api_url.get_api_url(&ApiName::DisconnectVPN),
-            format!("https://192.0.2.1:8443/vpn/report?{query}")
-        );
-    }
-
-    #[test]
-    fn custom_android_profile_is_used_by_gateway_and_data_plane_urls() {
-        let conf: Config = serde_json::from_value(json!({
-            "company_name": "test",
-            "username": "test",
-            "server": "https://vpn.example.com",
-            "android_profile": {
-                "brand": "samsung",
-                "model": "SM-S9210",
-                "android_release": "14",
-                "os_version": "34",
-                "os_version_patch": "2025-04-01"
-            }
-        }))
-        .unwrap();
-        let mut api_url = ApiUrl::new(&conf).unwrap();
-        let query = "os_version_patch=2025-04-01&os=Android&app_version=3.3.16&os_version=34&build_number=2279&model=SM-S9210&language=en&client_source=FeiLian&brand=samsung";
-
-        assert_eq!(
-            api_url.get_api_url(&ApiName::ListVPN),
-            format!("https://vpn.example.com/api/vpn/list?{query}")
-        );
-
-        api_url.vpn_param.url = "https://192.0.2.1:8443".to_string();
-        assert_eq!(
-            api_url.get_api_url(&ApiName::ConnectVPN),
-            format!("https://192.0.2.1:8443/vpn/conn?{query}")
-        );
+        let connect_url = api_url.get_api_url(&ApiName::ConnectVPN);
+        assert!(connect_url.starts_with(
+            "https://192.0.2.1:8443/vpn/conn?app_version=3.3.17&brand=&build_number=8135"
+        ));
+        assert!(connect_url.contains("os=Linux"));
+        assert!(!connect_url.contains("timestamp="));
         assert_eq!(
             api_url.get_api_url(&ApiName::DisconnectVPN),
-            format!("https://192.0.2.1:8443/vpn/report?{query}")
+            "https://192.0.2.1:8443/vpn/report?os=Android&os_version=2"
         );
     }
 }

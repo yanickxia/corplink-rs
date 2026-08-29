@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 
-use crate::api::{ApiName, ApiUrl, URL_GET_COMPANY};
+use crate::api::{ApiName, ApiUrl, CORPLINK_APP_VERSION, URL_GET_COMPANY};
 use crate::config::{
     Config, WgConf, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1, PLATFORM_LARK, PLATFORM_LDAP,
     PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
@@ -124,14 +124,23 @@ async fn resolve_additional_domains(
     routes
 }
 
-fn corplink_client_builder(user_agent: &str) -> ClientBuilder {
+fn corplink_client_builder() -> ClientBuilder {
     ClientBuilder::new()
         // CorpLink deployments may use certificates signed by their own CA.
         .danger_accept_invalid_certs(true)
         // for debug
         // .proxy(reqwest::Proxy::all("socks5://192.168.111.233:8001").unwrap())
-        .user_agent(user_agent)
+        .user_agent(format!(
+            "CorpLink/{CORPLINK_APP_VERSION} (linux; Linux; en)"
+        ))
         .timeout(Duration::from_millis(10000))
+}
+
+fn vpn_connect_body(public_key: &str, otp: &str) -> Map<String, Value> {
+    let mut body = Map::new();
+    body.insert("public_key".to_string(), json!(public_key));
+    body.insert("otp".to_string(), json!(otp));
+    body
 }
 
 #[derive(Clone)]
@@ -233,13 +242,12 @@ impl Client {
         }
 
         let cookie_store = Arc::new(CookieStoreMutex::new(cookie_store));
-        let user_agent = conf.android_user_agent();
 
         // Keep probe responses out of the shared cookie store until an endpoint is selected.
-        let probe_client = corplink_client_builder(&user_agent)
+        let probe_client = corplink_client_builder()
             .build()
             .context("build VPN probe HTTP client")?;
-        let c = corplink_client_builder(&user_agent)
+        let c = corplink_client_builder()
             .cookie_provider(Arc::clone(&cookie_store))
             .build()
             .context("build http client")?;
@@ -320,11 +328,11 @@ impl Client {
             let mut url = Url::from_str(&url_str)
                 .with_context(|| format!("invalid api url {url_str} for {api:?}"))?;
 
-            // timestamp（秒）加入 query：签名端点需要它参与签名；退出时的
-            // /vpn/report 断连通知也需要 timestamp 防重放。
-            let needs_timestamp =
-                sign::sign_mask_by_path(url.path()).is_some() || url.path() == "/vpn/report";
-            if needs_timestamp {
+            // The community Linux client timestamps only the signed list/connect
+            // requests. Ping and disconnect report keep their minimal Android-v2
+            // query shape and are deliberately unsigned.
+            let is_signed = sign::sign_mask_by_path(url.path()).is_some();
+            if is_signed {
                 let ts = self.current_timestamp().to_string();
                 // 用 query_pairs_mut 追加，保持既有参数在前、timestamp 在后；
                 // 之后签名与发送都用这个 url，保证逐字节一致。
@@ -336,8 +344,7 @@ impl Client {
             let csrf = cookie_value(&cookie_str, "csrf-token")
                 .unwrap_or("")
                 .to_owned();
-            let is_data_plane = matches!(url.path(), "/vpn/conn" | "/vpn/report");
-            let request_jwt = is_data_plane
+            let signing_jwt = (url.path() == "/vpn/conn")
                 .then(|| cookie_value(&cookie_str, "vpn-token").map(str::to_owned))
                 .flatten();
             let sign_header = self.build_sign_header_with_cookie(
@@ -346,7 +353,7 @@ impl Client {
                 body_bytes,
                 &cookie_str,
                 &csrf,
-                request_jwt.as_deref().unwrap_or(""),
+                signing_jwt.as_deref().unwrap_or(""),
             )?;
 
             let mut rb = match &body_string {
@@ -363,11 +370,6 @@ impl Client {
             }
             if !cookie_str.is_empty() {
                 rb = rb.header(header::COOKIE, &cookie_str);
-            }
-            // 数据面的签名与 jwt-token 头始终来自同一份当前 Cookie，避免
-            // 维护第二份可过期的 token 状态。
-            if let Some(jwt) = request_jwt.as_deref() {
-                rb = rb.header("jwt-token", jwt);
             }
             if let Some((name, value)) = sign_header {
                 log::debug!("signing {api:?} path={}", url.path());
@@ -405,7 +407,7 @@ impl Client {
             })?;
 
             // 签名时间戳过期错误：刷新后重试一次
-            if attempt == 0 && SIGN_RETRY_CODES.contains(&raw.code) {
+            if is_signed && attempt == 0 && SIGN_RETRY_CODES.contains(&raw.code) {
                 log::warn!("sign timestamp rejected (code {}), retrying once", raw.code);
                 continue;
             }
@@ -1124,92 +1126,43 @@ impl Client {
         api_url.vpn_param.url = endpoint_url.to_string().trim_end_matches('/').to_string();
 
         let cookie_header = self.probe_cookie_header()?;
-        let cookie_str = match cookie_header.as_ref() {
-            Some(value) => value
-                .to_str()
-                .context("VPN probe Cookie header is not valid text")?
-                .to_owned(),
-            None => String::new(),
-        };
-        let csrf = cookie_value(&cookie_str, "csrf-token")
-            .unwrap_or("")
-            .to_owned();
         let started = Instant::now();
-        let mut date_offset_sec = self.date_offset_sec;
-
-        for attempt in 0..2 {
-            let url_str = api_url.get_api_url(&ApiName::PingVPN);
-            let mut url = Url::from_str(&url_str)
-                .with_context(|| format!("invalid VPN probe url {url_str}"))?;
-            let timestamp = Utc::now().timestamp() + date_offset_sec as i64;
-            url.query_pairs_mut()
-                .append_pair("timestamp", &timestamp.to_string());
-            let sign_header =
-                self.build_sign_header_with_cookie(
-                    "GET",
-                    &url,
-                    b"",
-                    &cookie_str,
-                    &csrf,
-                    cookie_value(&cookie_str, "vpn-token").unwrap_or(""),
-                )?;
-
-            let mut request = self.probe_client.get(url);
-            if let Some(cookies) = cookie_header.as_ref() {
-                request = request.header(header::COOKIE, cookies);
-            }
-            if !csrf.is_empty() {
-                request = request.header("csrf-token", &csrf);
-            }
-            if let Some(jwt) = cookie_value(&cookie_str, "vpn-token") {
-                request = request.header("jwt-token", jwt);
-            }
-            if let Some((name, value)) = sign_header {
-                request = request.header(name, value);
-            }
-
-            let response = request.send().await.context("VPN probe request failed")?;
-            if let Some(offset) = Self::time_offset_from_date_header(&response) {
-                date_offset_sec = offset;
-            }
-            let status = response.status();
-            let set_cookie_headers = response
-                .headers()
-                .get_all(header::SET_COOKIE)
-                .iter()
-                .cloned()
-                .collect();
-            let body = response
-                .text()
-                .await
-                .context("failed to read VPN probe response body")?;
-
-            if !status.is_success() {
-                bail!("VPN probe returned HTTP status {status}");
-            }
-            let resp: Resp<Value> = serde_json::from_str(&body)
-                .with_context(|| format!("failed to parse VPN probe response: {body}"))?;
-            if attempt == 0 && SIGN_RETRY_CODES.contains(&resp.code) {
-                log::warn!(
-                    "VPN probe sign timestamp rejected (code {}), retrying once",
-                    resp.code
-                );
-                continue;
-            }
-            return match resp.code {
-                0 => Ok(VpnProbeResponse {
-                    latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-                    set_cookie_headers,
-                }),
-                _ => bail!(format!(
-                    "failed to ping vpn with error {}: {}",
-                    resp.code,
-                    resp.message.unwrap_or_default()
-                )),
-            };
+        let url_str = api_url.get_api_url(&ApiName::PingVPN);
+        let url =
+            Url::from_str(&url_str).with_context(|| format!("invalid VPN probe url {url_str}"))?;
+        let mut request = self.probe_client.get(url);
+        if let Some(cookies) = cookie_header.as_ref() {
+            request = request.header(header::COOKIE, cookies);
         }
+        let response = request.send().await.context("VPN probe request failed")?;
+        let status = response.status();
+        let set_cookie_headers = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .cloned()
+            .collect();
+        let body = response
+            .text()
+            .await
+            .context("failed to read VPN probe response body")?;
 
-        bail!("VPN probe retry loop exhausted")
+        if !status.is_success() {
+            bail!("VPN probe returned HTTP status {status}");
+        }
+        let resp: Resp<Value> = serde_json::from_str(&body)
+            .with_context(|| format!("failed to parse VPN probe response: {body}"))?;
+        match resp.code {
+            0 => Ok(VpnProbeResponse {
+                latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                set_cookie_headers,
+            }),
+            _ => bail!(format!(
+                "failed to ping vpn with error {}: {}",
+                resp.code,
+                resp.message.unwrap_or_default()
+            )),
+        }
     }
 
     async fn fetch_peer_info(&mut self, public_key: &String) -> Result<RespWgInfo> {
@@ -1239,19 +1192,7 @@ impl Client {
                 otp = utils::read_line().await?;
             }
         }
-        let mut m = Map::new();
-        m.insert("public_key".to_string(), json!(public_key));
-        m.insert("otp".to_string(), json!(otp));
-        // 与真机客户端一致：/vpn/conn body 还需 mode/export_id/not_auto。
-        m.insert(
-            "mode".to_string(),
-            json!(match self.conf.route_mode.clone().unwrap_or_default() {
-                crate::config::RouteMode::Split => "Split",
-                crate::config::RouteMode::Full => "Full",
-            }),
-        );
-        m.insert("export_id".to_string(), json!(0));
-        m.insert("not_auto".to_string(), json!(false));
+        let m = vpn_connect_body(public_key, &otp);
         let resp = self
             .request::<RespWgInfo>(ApiName::ConnectVPN, Some(m))
             .await?;
@@ -1333,8 +1274,8 @@ impl Client {
             &mut selected_vpn.set_cookie_headers.iter(),
             &endpoint_url,
         );
-        // `/vpn/conn` 的签名和 jwt-token 请求头都直接使用选中节点当前的
-        // vpn-token Cookie，不再维护第二份 token 快照。
+        // `/vpn/conn` 的签名直接使用选中节点当前的 vpn-token Cookie；
+        // 社区 Linux 客户端不另外发送 jwt-token 请求头。
         self.save_cookie()?;
         let vpn_addr = match vpn.ip.parse::<IpAddr>() {
             Ok(ip) => SocketAddr::new(ip, vpn.vpn_port).to_string(),
@@ -1531,7 +1472,6 @@ impl Client {
             routes,
             dns,
             // `force_protocol`, when set, overrides the server-advertised `protocol_mode`
-            vpn_ip,
             protocol: match self.conf.force_protocol.as_deref() {
                 Some(p) if p.eq_ignore_ascii_case("udp") => 0,
                 Some(p) if p.eq_ignore_ascii_case("tcp") => 1,
@@ -1548,7 +1488,7 @@ impl Client {
 
     fn vpn_disconnect_body(&self, conf: &WgConf) -> Map<String, Value> {
         let mut m = Map::new();
-        m.insert("ip".to_string(), json!(&conf.vpn_ip));
+        m.insert("ip".to_string(), json!(&conf.address));
         m.insert("public_key".to_string(), json!(conf.public_key));
         m.insert(
             "mode".to_string(),
@@ -1569,7 +1509,7 @@ impl Client {
         match resp.code {
             0 => Ok(()),
             _ => bail!(format!(
-                "failed to fetch peer info with error {}: {}",
+                "failed to disconnect VPN with error {}: {}",
                 resp.code,
                 resp.message.unwrap_or_default()
             )),
@@ -1629,8 +1569,8 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        corplink_client_builder, merge_additional_routes, resolve_additional_domains, Client,
-        ReqwestCookieStore,
+        cookie_value, corplink_client_builder, merge_additional_routes, resolve_additional_domains,
+        vpn_connect_body, Client, ReqwestCookieStore,
     };
     use crate::api::{ApiName, ApiUrl};
     use crate::config::{Config, WgConf};
@@ -1692,6 +1632,25 @@ mod tests {
         String::from_utf8(request).unwrap()
     }
 
+    async fn start_response_server(
+        body: &'static str,
+    ) -> (u16, oneshot::Receiver<String>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_tx, request_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            request_tx.send(request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (port, request_rx, task)
+    }
+
     fn request_header<'a>(request: &'a str, expected_name: &str) -> Option<&'a str> {
         request.lines().skip(1).find_map(|line| {
             let (name, value) = line.split_once(':')?;
@@ -1708,7 +1667,7 @@ mod tests {
         let url = Url::parse(&format!("http://localhost{target}")).unwrap();
         let cookie = request_header(request, "cookie").unwrap_or("");
         let csrf = request_header(request, "csrf-token").unwrap_or("");
-        let jwt = request_header(request, "jwt-token").unwrap_or("");
+        let jwt = cookie_value(cookie, "vpn-token").unwrap_or("");
         let actual = request_header(request, sign::SIGN_HEADER).expect("missing Sign header");
         let mask = sign::sign_mask_by_path(url.path()).expect("path should be signed");
         let expected = sign::compute_sign(
@@ -1835,32 +1794,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_android_user_agent_is_applied_to_http_clients() {
-        let conf: Config = serde_json::from_value(json!({
-            "company_name": "test",
-            "username": "test",
-            "android_profile": {
-                "brand": "samsung",
-                "model": "SM-S9210",
-                "android_release": "14"
-            }
-        }))
-        .unwrap();
+    async fn community_linux_user_agent_is_applied_to_http_clients() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let request = read_request(&mut stream).await;
             stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
             request
         });
-        let user_agent = conf.android_user_agent();
-        let client = corplink_client_builder(&user_agent).build().unwrap();
+        let client = corplink_client_builder().build().unwrap();
         client
             .get(format!("http://{address}"))
             .send()
@@ -1870,7 +1816,7 @@ mod tests {
 
         assert_eq!(
             request_header(&request, "user-agent"),
-            Some("CorpLink/3.3.16 (samsungSM-S9210; Android 14; en)")
+            Some("CorpLink/3.3.17 (linux; Linux; en)")
         );
     }
 
@@ -1914,18 +1860,18 @@ mod tests {
                 .and_then(|value| super::cookie_value(value, "device_id")),
             Some("test-device")
         );
-        assert!(first_request.contains("user-agent: corplink/3.3.16 "));
-        assert!(second_request.contains("user-agent: corplink/3.3.16 "));
-        assert!(first_request.contains(
-            "get /vpn/ping?os_version_patch=2018-01-05&os=android&app_version=3.3.16&os_version=27&build_number=2279&model=android%20sdk%20built%20for%20arm64&language=en&client_source=feilian&brand=android&timestamp="
-        ));
-        assert!(second_request.contains(
-            "get /vpn/ping?os_version_patch=2018-01-05&os=android&app_version=3.3.16&os_version=27&build_number=2279&model=android%20sdk%20built%20for%20arm64&language=en&client_source=feilian&brand=android&timestamp="
-        ));
-        assert!(first_request.contains("sign: v1;"));
-        assert!(second_request.contains("sign: v1;"));
-        assert!(first_request.contains("csrf-token: fresh-csrf"));
-        assert!(second_request.contains("csrf-token: fresh-csrf"));
+        assert!(first_request.contains("user-agent: corplink/3.3.17 "));
+        assert!(second_request.contains("user-agent: corplink/3.3.17 "));
+        assert!(first_request.contains("get /vpn/ping?os=android&os_version=2 http/1.1"));
+        assert!(second_request.contains("get /vpn/ping?os=android&os_version=2 http/1.1"));
+        assert!(!first_request.contains("timestamp="));
+        assert!(!second_request.contains("timestamp="));
+        assert!(!first_request.contains("sign: "));
+        assert!(!second_request.contains("sign: "));
+        assert!(!first_request.contains("jwt-token: "));
+        assert!(!second_request.contains("jwt-token: "));
+        assert!(!first_request.contains("csrf-token: "));
+        assert!(!second_request.contains("csrf-token: "));
 
         {
             let cookie_store = client.cookie.lock().unwrap();
@@ -2032,21 +1978,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_probe_retries_with_refreshed_timestamp() {
-        let (port, requests_rx, server_task) = start_sign_retry_server().await;
-        let client = test_client();
+    async fn connect_request_matches_community_linux_wire_shape() {
+        let (port, request_rx, server_task) =
+            start_response_server(r#"{"code":0,"data":{}}"#).await;
+        let mut client = test_client();
+        let endpoint_url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        client.api_url.vpn_param.url = endpoint_url.as_str().trim_end_matches('/').to_string();
+        client
+            .cookie
+            .lock()
+            .unwrap()
+            .insert_raw(&RawCookie::new("vpn-token", "token-a"), &endpoint_url)
+            .unwrap();
 
-        let selected = client
-            .get_first_available_vpn(vec![vpn_info(port, "retry-node")])
+        client
+            .request::<serde_json::Value>(
+                ApiName::ConnectVPN,
+                Some(vpn_connect_body("client-public-key", "123456")),
+            )
             .await
-            .expect("probe should retry after a sign timestamp rejection");
-        assert_eq!(selected.vpn.en_name, "retry-node");
+            .unwrap();
 
-        let requests = requests_rx.await.unwrap();
-        assert_eq!(requests.len(), 2);
-        let first_timestamp = assert_valid_wire_signature(&requests[0], "test", "test-device");
-        let second_timestamp = assert_valid_wire_signature(&requests[1], "test", "test-device");
-        assert!(second_timestamp - first_timestamp >= 100);
+        let request = request_rx.await.unwrap();
+        let request_line = request.lines().next().unwrap();
+        assert!(request_line.starts_with(
+            "POST /vpn/conn?app_version=3.3.17&brand=&build_number=8135&client_source=FeiLian&language=en&model=&os=Linux&"
+        ));
+        assert!(request_line.contains("&soc="));
+        assert!(request_line.contains("&timestamp="));
+        assert!(request_header(&request, sign::SIGN_HEADER).is_some());
+        assert!(request_header(&request, "jwt-token").is_none());
+        assert_eq!(
+            request_header(&request, "cookie").and_then(|value| cookie_value(value, "vpn-token")),
+            Some("token-a")
+        );
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("missing HTTP request body");
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "public_key": "client-public-key",
+                "otp": "123456"
+            })
+        );
+        assert!(body.get("mode").is_none());
+        assert!(body.get("export_id").is_none());
+        assert!(body.get("not_auto").is_none());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_request_matches_community_unsigned_wire_shape() {
+        let (port, request_rx, server_task) =
+            start_response_server(r#"{"code":0,"data":{}}"#).await;
+        let mut client = test_client();
+        client.api_url.vpn_param.url = format!("http://127.0.0.1:{port}");
+        let conf = WgConf {
+            address: "192.0.2.42/24".to_string(),
+            address6: String::new(),
+            peer_address: "192.0.2.1:80".to_string(),
+            mtu: 1280,
+            public_key: "client-public-key".to_string(),
+            private_key: "client-private-key".to_string(),
+            peer_key: "peer-public-key".to_string(),
+            allowed_ips: Vec::new(),
+            routes: Vec::new(),
+            dns: "192.0.2.53".to_string(),
+            protocol: 0,
+        };
+
+        client.disconnect_vpn(&conf).await.unwrap();
+
+        let request = request_rx.await.unwrap();
+        assert_eq!(
+            request.lines().next().unwrap(),
+            "POST /vpn/report?os=Android&os_version=2 HTTP/1.1"
+        );
+        assert!(request_header(&request, sign::SIGN_HEADER).is_none());
+        assert!(request_header(&request, "jwt-token").is_none());
+        assert!(!request.contains("timestamp="));
         server_task.await.unwrap();
     }
 
@@ -2123,7 +2136,7 @@ mod tests {
     }
 
     #[test]
-    fn vpn_disconnect_body_uses_raw_assigned_ip() {
+    fn vpn_disconnect_body_matches_community_cidr_shape() {
         let client = test_client();
         let conf = WgConf {
             address: "192.0.2.42/24".to_string(),
@@ -2136,14 +2149,13 @@ mod tests {
             allowed_ips: Vec::new(),
             routes: Vec::new(),
             dns: "192.0.2.53".to_string(),
-            vpn_ip: "192.0.2.42".to_string(),
             protocol: 0,
         };
 
         assert_eq!(
             client.vpn_disconnect_body(&conf),
             json!({
-                "ip": "192.0.2.42",
+                "ip": "192.0.2.42/24",
                 "mode": "Split",
                 "public_key": "client-public-key",
                 "type": "101"
@@ -2247,6 +2259,37 @@ mod tests {
             .expect("signed path should produce a header");
         assert_eq!(name, sign::SIGN_HEADER);
         assert!(value.starts_with("v1;"), "unexpected sign value: {value}");
+    }
+
+    #[test]
+    fn connect_signature_uses_vpn_cookie_without_jwt_header_state() {
+        let client = sign_test_client(sign_test_config(Some("dev-123")));
+        let url = Url::parse("https://example.com/vpn/conn?timestamp=1700000000").unwrap();
+        client
+            .cookie
+            .lock()
+            .unwrap()
+            .insert_raw(&RawCookie::new("vpn-token", "token-a"), &url)
+            .unwrap();
+        let body = br#"{"public_key":"key","otp":""}"#;
+        let (_, actual) = client
+            .build_sign_header("POST", &url, body)
+            .unwrap()
+            .expect("connect must be signed");
+        let expected = sign::compute_sign(
+            "TestCo",
+            "dev-123",
+            "POST",
+            "/vpn/conn",
+            "timestamp=1700000000",
+            body,
+            "",
+            "",
+            "token-a",
+            0x21e,
+        );
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
