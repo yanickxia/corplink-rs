@@ -1,6 +1,6 @@
 //! 飞连（CorpLink）请求签名算法（HKDF-SHA256 派生密钥 + HMAC-SHA256）。
 //!
-//! canonical 构造与真机安卓客户端对齐（frida SSL 明文抓包逐字节核对，服务端 code:0 接受）：
+//! canonical 构造与社区 Linux 客户端对齐：
 //! `canonical = method ++ path ++ query ++ bodyHash ++ cookieStr ++ csrf`——**直接拼接、无分隔符**，
 //! bodyHash 为原始 32 字节 sha256(body)，空 body 时整段省略。密钥派生沿用 Go 二进制逆向所得。
 //! 本模块为纯函数、无 IO，可离线单测。
@@ -24,9 +24,9 @@ pub(crate) fn body_hash(body: &[u8]) -> [u8; 32] {
 
 /// HKDF-SHA256 派生 32 字节签名密钥。
 /// salt=None（等价 RFC5869 的 HashLen 个 0 字节，与 Go x/crypto/hkdf 的 nil 一致）。
-/// info = company.to_lowercase() + "|" + device_id。
+/// info = company + "|" + device_id。
 pub(crate) fn derive_sign_key(company: &str, device_id: &str) -> [u8; 32] {
-    let info = format!("{}|{}", company.to_lowercase(), device_id);
+    let info = format!("{}|{}", company, device_id);
     let hk = Hkdf::<Sha256>::new(None, IKM);
     let mut okm = [0u8; 32];
     hk.expand(info.as_bytes(), &mut okm)
@@ -147,17 +147,13 @@ pub(crate) fn compute_sign(
 }
 
 /// 返回该 path 对应的签名 mask；不在表中的 path 不签名（返回 None）。
-/// 网关端点（/api/*、/vpn/ping）用 0x1fe（含 cookie+csrf）；数据面 /vpn/conn 用 0x21e
-/// （bits 1,2,3,4,9 = method/path/query/bodyHash/jwtToken，无 cookie/csrf），jwt 取自 vpn-token cookie。
-/// **/vpn/report（退出时的断连通知）不签名**：真机抓包证实其只带
-/// cookie+csrf+jwt-token 头、无 Sign 头。以上均经真机抓包验证。
+/// 社区 Linux 客户端只签名节点列表和连接请求：列表用 0x1fe（含
+/// cookie+csrf），/vpn/conn 用 0x21e（method/path/query/bodyHash/vpn-token）。
+/// /vpn/ping 和 /vpn/report 都不签名。
 pub(crate) fn sign_mask_by_path(path: &str) -> Option<u64> {
     match path {
         "/api/vpn/list" => Some(0x1fe),
-        "/vpn/ping" => Some(0x1fe),
         "/vpn/conn" => Some(0x21e),
-        "/api/device/report" => Some(0x1fe),
-        "/api/emgr/device/report" => Some(0x1fe),
         _ => None,
     }
 }
@@ -182,11 +178,11 @@ mod tests {
     #[test]
     fn test_sign_mask_by_path() {
         assert_eq!(sign_mask_by_path("/api/vpn/list"), Some(0x1fe));
-        assert_eq!(sign_mask_by_path("/vpn/ping"), Some(0x1fe));
+        assert_eq!(sign_mask_by_path("/vpn/ping"), None);
         assert_eq!(sign_mask_by_path("/vpn/conn"), Some(0x21e));
-        assert_eq!(sign_mask_by_path("/vpn/report"), None); // 断连通知不签名
-        assert_eq!(sign_mask_by_path("/api/device/report"), Some(0x1fe));
-        assert_eq!(sign_mask_by_path("/api/emgr/device/report"), Some(0x1fe));
+        assert_eq!(sign_mask_by_path("/vpn/report"), None);
+        assert_eq!(sign_mask_by_path("/api/device/report"), None);
+        assert_eq!(sign_mask_by_path("/api/emgr/device/report"), None);
         assert_eq!(sign_mask_by_path("/api/login"), None);
         assert_eq!(sign_mask_by_path("/api/vpn/list/"), None); // 精确匹配，尾斜杠不命中
     }
@@ -202,9 +198,8 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_sign_key_lowercases_company() {
-        // info 用 company.to_lowercase()，故大小写不影响结果
-        assert_eq!(
+    fn test_derive_sign_key_preserves_company_case() {
+        assert_ne!(
             derive_sign_key("ACME", "deadbeef"),
             derive_sign_key("acme", "deadbeef")
         );
