@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod dns;
 mod qrcode;
+mod recovery;
 mod resp;
 mod sign;
 mod state;
@@ -18,12 +19,19 @@ use is_elevated;
 use dns::DNSManager;
 
 use std::env;
-use std::process::exit;
+use std::process::{exit, Command};
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{anyhow, Context, Result};
 
 use client::Client;
 use config::{Config, WgConf};
+use recovery::RecoveryMonitor;
+
+const RECOVERY_REBUILD_NOT_BEFORE_ENV: &str = "CORPLINK_RECOVERY_REBUILD_NOT_BEFORE";
 
 fn print_usage_and_exit(name: &str, conf: &str) {
     println!("usage:\n\t{} {}", name, conf);
@@ -59,6 +67,11 @@ fn parse_arg() -> String {
 pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const ETIMEDOUT: i32 = 110;
+
+enum TunnelAction {
+    Exit(i32),
+    Restart { cooldown_secs: u64 },
+}
 
 async fn wait_for_tunnel_exit<S, W>(shutdown: S, handshake: W) -> i32
 where
@@ -133,6 +146,14 @@ async fn run() -> Result<()> {
 
     let with_wg_log = conf.debug_wg.unwrap_or_default();
     let platform = conf.platform.clone();
+    let recovery_config = conf
+        .tunnel_recovery
+        .clone()
+        .filter(|recovery| recovery.enabled);
+    let control_plane_url = conf
+        .server
+        .clone()
+        .context("server url missing after company discovery")?;
     let mut c = Client::new(conf).context("failed to initialize client")?;
     let mut logout_retry = true;
     let wg_conf: Option<WgConf>;
@@ -166,8 +187,14 @@ async fn run() -> Result<()> {
     let mut uapi = wg::UAPIClient { name: name.clone() };
     if let Some(listen) = &socks5_listen {
         log::info!("start wg-corplink (netstack/socks5) on {}", listen);
-        wg::start_wg_go_netstack(&wg_conf, listen, &socks5_username, &socks5_password, with_wg_log)
-            .context("failed to start wg-corplink in netstack mode")?;
+        wg::start_wg_go_netstack(
+            &wg_conf,
+            listen,
+            &socks5_username,
+            &socks5_password,
+            with_wg_log,
+        )
+        .context("failed to start wg-corplink in netstack mode")?;
         uapi.config_wg_netstack(&wg_conf)
             .await
             .context("failed to config netstack interface with uapi")?;
@@ -201,27 +228,127 @@ async fn run() -> Result<()> {
         }
     }
 
-    // `/vpn/report` is control-plane telemetry, not tunnel liveness. The actual
-    // tunnel already has WireGuard persistent keepalive configured; only stop on
-    // an explicit shutdown or when the WireGuard handshake monitor expires.
-    let exit_code = wait_for_tunnel_exit(wait_for_shutdown_signal(), async {
-        uapi.check_wg_connection().await;
-        log::warn!("last handshake timeout");
-    })
-    .await;
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
 
-    // shutdown
-    log::info!("disconnecting vpn...");
-    if let Err(e) = c.disconnect_vpn(&wg_conf).await {
-        log::warn!("failed to disconnect vpn: {}", e)
+    // `/vpn/report` is control-plane telemetry, not tunnel liveness. In stable
+    // mode keep the 6.5.2 behavior. The preview recovery block adds an active
+    // access probe plus handshake freshness, underlay discrimination, a bind
+    // repair attempt and finally a process-level full rebuild.
+    let action = if let Some(recovery_config) = recovery_config {
+        log::info!(
+            "tunnel recovery enabled: probe={} underlay={} interval={}s",
+            recovery_config.tunnel_probe_url,
+            recovery_config
+                .underlay_probe_url
+                .as_deref()
+                .unwrap_or(&control_plane_url),
+            recovery_config.probe_interval_secs.max(1),
+        );
+        let mut monitor = RecoveryMonitor::new(
+            recovery_config,
+            &control_plane_url,
+            socks5_listen.as_deref(),
+            &socks5_username,
+            &socks5_password,
+        )?;
+
+        loop {
+            let reason = tokio::select! {
+                _ = &mut shutdown => break TunnelAction::Exit(0),
+                reason = monitor.wait_until_unhealthy(&uapi) => reason,
+            };
+            log::warn!("recovery: event=availability action=accepted reason={reason:?}");
+
+            let repair_delay = Duration::from_secs(monitor.config().repair_delay_secs);
+            if !repair_delay.is_zero() {
+                tokio::select! {
+                    _ = &mut shutdown => break TunnelAction::Exit(0),
+                    _ = tokio::time::sleep(repair_delay) => {}
+                }
+            }
+
+            log::warn!("recovery: event=transport_repair action=start");
+            let repair_timeout = Duration::from_secs(monitor.config().repair_timeout_secs.max(1));
+            let repair_uapi = uapi.clone();
+            let repair_conf = wg_conf.clone();
+            let repair_task = tokio::task::spawn_blocking(move || {
+                repair_uapi.repair_transport(&repair_conf)
+            });
+            let repaired = match tokio::time::timeout(repair_timeout, repair_task).await {
+                Ok(Ok(Ok(()))) => {
+                    log::info!("recovery: event=transport_repair action=rebound");
+                    tokio::select! {
+                        _ = &mut shutdown => break TunnelAction::Exit(0),
+                        validated = monitor.validate_transport(&uapi) => validated,
+                    }
+                }
+                Ok(Ok(Err(err))) => {
+                    log::warn!("recovery: event=transport_repair action=failed error={err:#}");
+                    false
+                }
+                Ok(Err(err)) => {
+                    log::warn!("recovery: event=transport_repair action=join_failed error={err}");
+                    false
+                }
+                Err(_) => {
+                    log::warn!("recovery: event=transport_repair action=timeout");
+                    false
+                }
+            };
+            if repaired {
+                log::info!("recovery: event=transport_repair action=success");
+                monitor.reset();
+                continue;
+            }
+
+            let now = chrono::Utc::now().timestamp();
+            if let Some(not_before) = recovery_rebuild_not_before() {
+                if now < not_before {
+                    log::warn!(
+                        "recovery: event=rebuild_budget action=deny retry_after={}s",
+                        not_before - now
+                    );
+                    monitor.reset();
+                    continue;
+                }
+            }
+            let cooldown_secs = monitor.config().rebuild_cooldown_secs.max(1);
+            log::warn!(
+                "recovery: event=rebuild_budget action=admit next_allowed={}s",
+                cooldown_secs
+            );
+            break TunnelAction::Restart { cooldown_secs };
+        }
+    } else {
+        let exit_code = wait_for_tunnel_exit(&mut shutdown, async {
+            uapi.check_wg_connection().await;
+            log::warn!("last handshake timeout");
+        })
+        .await;
+        TunnelAction::Exit(exit_code)
     };
 
-    // only logout for feilian_v1
-    if platform.as_deref() == Some(config::PLATFORM_CORPLINK_V1) {
-        log::info!("logging out current terminal...");
-        if let Err(e) = c.logout().await {
-            log::warn!("failed to logout: {}", e)
+    // shutdown
+    if matches!(action, TunnelAction::Exit(_)) {
+        log::info!("disconnecting vpn...");
+        if let Err(e) = c.disconnect_vpn(&wg_conf).await {
+            log::warn!("failed to disconnect vpn: {}", e)
         };
+
+        // only logout for feilian_v1
+        if platform.as_deref() == Some(config::PLATFORM_CORPLINK_V1) {
+            log::info!("logging out current terminal...");
+            if let Err(e) = c.logout().await {
+                log::warn!("failed to logout: {}", e)
+            };
+        }
+    } else {
+        // A rebuild deliberately keeps the control-plane session/cookies and
+        // public key. The replacement process immediately requests a fresh
+        // peer configuration, matching the community recovery lifecycle more
+        // closely than an explicit disconnect/logout.
+        log::warn!("recovery: event=full_rebuild action=cleanup");
     }
 
     wg::stop_wg_go();
@@ -236,8 +363,47 @@ async fn run() -> Result<()> {
         }
     }
 
-    log::info!("reach exit");
-    exit(exit_code)
+    match action {
+        TunnelAction::Exit(exit_code) => {
+            log::info!("reach exit");
+            exit(exit_code)
+        }
+        TunnelAction::Restart { cooldown_secs } => {
+            log::warn!("recovery: event=full_rebuild action=exec");
+            restart_current_process(&conf_file, cooldown_secs)
+        }
+    }
+}
+
+fn recovery_rebuild_not_before() -> Option<i64> {
+    env::var(RECOVERY_REBUILD_NOT_BEFORE_ENV)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+}
+
+fn restart_current_process(conf_file: &str, cooldown_secs: u64) -> Result<()> {
+    let executable = env::current_exe().context("failed to locate current executable")?;
+    let not_before = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(cooldown_secs.min(i64::MAX as u64) as i64);
+    let mut command = Command::new(executable);
+    command
+        .arg(conf_file)
+        .env(RECOVERY_REBUILD_NOT_BEFORE_ENV, not_before.to_string());
+
+    #[cfg(unix)]
+    {
+        let err = command.exec();
+        Err(err).context("failed to exec replacement corplink-rs process")
+    }
+
+    #[cfg(windows)]
+    {
+        command
+            .spawn()
+            .context("failed to spawn replacement corplink-rs process")?;
+        exit(0)
+    }
 }
 
 // Resolve when the process is asked to terminate: ctrl+c (SIGINT) or, on unix,

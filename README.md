@@ -235,7 +235,29 @@ RUST_LOG=debug ./corplink-rs config.json
   // thresholds) for them in /api/vpn/list. since WireGuard-over-TCP can collapse to a few
   // KB/s on a lossy uplink (TCP-over-TCP), forcing "udp" can be far faster there.
   // leave unset to follow the server's protocol_mode (1 => tcp, otherwise udp).
-  "force_protocol": "udp"
+  "force_protocol": "udp",
+  // preview: opt-in corplink-web-style availability detection and recovery.
+  // The block being absent keeps the stable 6.5.2 lifecycle. An empty object
+  // enables defaults; override the URLs when code.byted.org is not the correct
+  // tunnel-only target for your company.
+  "tunnel_recovery": {
+    "enabled": true,
+    "tunnel_probe_url": "https://code.byted.org/",
+    // Defaults to the configured CorpLink server. In full-tunnel mode, choose
+    // a URL/IP excluded from AllowedIPs so this really tests underlay.
+    "underlay_probe_url": "https://corplink.example.com/",
+    "initial_delay_secs": 10,
+    "probe_interval_secs": 5,
+    "probe_timeout_secs": 5,
+    "handshake_stale_secs": 180,
+    "min_failures": 3,
+    "min_failure_window_secs": 30,
+    "reset_gap_secs": 90,
+    "repair_delay_secs": 10,
+    "repair_timeout_secs": 6,
+    "repair_validation_secs": 30,
+    "rebuild_cooldown_secs": 600
+  }
 }
 ```
 
@@ -261,6 +283,21 @@ curl --socks5-hostname user:pass@127.0.0.1:1080 https://intranet.example.com/
 ```
 
 此模式下 `interface_name`、`use_vpn_dns`、`auto_setup_routes` 等与系统网卡/路由相关的设置不生效。
+
+## Preview tunnel recovery
+
+`preview/tunnel-recovery` 分支新增一套显式启用的恢复监督器。它同时检查最近的
+WireGuard 握手年龄和必须经过隧道的 HTTP 请求；只有两个信号都至少失败 3 次、
+失败窗口达到 30 秒，且控制面/underlay 仍可访问时，才会接受恢复请求。
+
+恢复会先等待 10 秒，通过 UAPI 重新打开当前 WireGuard UDP/TCP bind 并重设 peer
+endpoint，再主动验证最多 30 秒。仍未恢复时，它先清理 TUN/DNS，再用同一份配置、
+Cookie、device ID 和 WireGuard key `exec` 一个全新进程。完整重建在 `exec` 前后共享
+10 分钟冷却预算，持续故障不会造成重启风暴；underlay 也不可用时则保留当前隧道。
+
+SOCKS5/netstack 模式下，隧道 HTTP 探测自动通过本机 SOCKS5 监听，并使用远端 DNS
+（`socks5h`）；内核 TUN 模式沿用 AllowedIPs/系统路由。在 full-tunnel 模式下，要让
+underlay 判断可信，应通过 `vpn_disallowed_routes` 明确排除 underlay 探测地址。
 
 # 原理和分析
 

@@ -40,6 +40,95 @@ pub enum RouteMode {
     Full,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_tunnel_probe_url() -> String {
+    "https://code.byted.org/".to_string()
+}
+
+fn default_initial_delay_secs() -> u64 {
+    10
+}
+
+fn default_probe_interval_secs() -> u64 {
+    5
+}
+
+fn default_probe_timeout_secs() -> u64 {
+    5
+}
+
+fn default_handshake_stale_secs() -> u64 {
+    180
+}
+
+fn default_min_failures() -> u32 {
+    3
+}
+
+fn default_min_failure_window_secs() -> u64 {
+    30
+}
+
+fn default_reset_gap_secs() -> u64 {
+    90
+}
+
+fn default_repair_delay_secs() -> u64 {
+    10
+}
+
+fn default_repair_timeout_secs() -> u64 {
+    6
+}
+
+fn default_repair_validation_secs() -> u64 {
+    30
+}
+
+fn default_rebuild_cooldown_secs() -> u64 {
+    10 * 60
+}
+
+/// Opt-in tunnel availability detection and recovery. Keeping the whole block
+/// absent preserves the stable 6.5.2 lifecycle.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TunnelRecoveryConfig {
+    /// Defaults to true when the `tunnel_recovery` block is present.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// An application URL which must be reachable through the tunnel.
+    #[serde(default = "default_tunnel_probe_url")]
+    pub tunnel_probe_url: String,
+    /// Direct-network/control-plane URL used to distinguish tunnel failure
+    /// from a general network outage. Defaults to the configured CorpLink server.
+    pub underlay_probe_url: Option<String>,
+    #[serde(default = "default_initial_delay_secs")]
+    pub initial_delay_secs: u64,
+    #[serde(default = "default_probe_interval_secs")]
+    pub probe_interval_secs: u64,
+    #[serde(default = "default_probe_timeout_secs")]
+    pub probe_timeout_secs: u64,
+    #[serde(default = "default_handshake_stale_secs")]
+    pub handshake_stale_secs: u64,
+    #[serde(default = "default_min_failures")]
+    pub min_failures: u32,
+    #[serde(default = "default_min_failure_window_secs")]
+    pub min_failure_window_secs: u64,
+    #[serde(default = "default_reset_gap_secs")]
+    pub reset_gap_secs: u64,
+    #[serde(default = "default_repair_delay_secs")]
+    pub repair_delay_secs: u64,
+    #[serde(default = "default_repair_timeout_secs")]
+    pub repair_timeout_secs: u64,
+    #[serde(default = "default_repair_validation_secs")]
+    pub repair_validation_secs: u64,
+    #[serde(default = "default_rebuild_cooldown_secs")]
+    pub rebuild_cooldown_secs: u64,
+}
+
 impl fmt::Display for RouteMode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -105,6 +194,8 @@ pub struct Config {
     /// head-of-line blocking), forcing "udp" can be far faster there. Leave unset to keep the
     /// default (follow server `protocol_mode`: 1 => tcp, otherwise udp).
     pub force_protocol: Option<String>,
+    /// Opt-in corplink-web-style tunnel detection and recovery.
+    pub tunnel_recovery: Option<TunnelRecoveryConfig>,
 }
 
 impl fmt::Display for Config {
@@ -199,4 +290,41 @@ pub struct WgConf {
 
     // corplink confs
     pub protocol: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_block_is_opt_in() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "company_name": "test",
+            "username": "test"
+        }))
+        .unwrap();
+        assert!(config.tunnel_recovery.is_none());
+    }
+
+    #[test]
+    fn empty_recovery_block_uses_community_thresholds() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "company_name": "test",
+            "username": "test",
+            "tunnel_recovery": {}
+        }))
+        .unwrap();
+        let recovery = config.tunnel_recovery.unwrap();
+
+        assert!(recovery.enabled);
+        assert_eq!(recovery.tunnel_probe_url, "https://code.byted.org/");
+        assert_eq!(recovery.initial_delay_secs, 10);
+        assert_eq!(recovery.probe_interval_secs, 5);
+        assert_eq!(recovery.min_failures, 3);
+        assert_eq!(recovery.min_failure_window_secs, 30);
+        assert_eq!(recovery.reset_gap_secs, 90);
+        assert_eq!(recovery.repair_delay_secs, 10);
+        assert_eq!(recovery.repair_timeout_secs, 6);
+        assert_eq!(recovery.rebuild_cooldown_secs, 600);
+    }
 }
