@@ -70,6 +70,23 @@ fn uapi(buff: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+fn latest_handshake_timestamp(response: &str) -> Option<i64> {
+    response
+        .lines()
+        .filter_map(|line| line.strip_prefix("last_handshake_time_sec="))
+        .filter_map(|value| value.parse::<i64>().ok())
+        .filter(|timestamp| *timestamp > 0)
+        .max()
+}
+
+fn repair_transport_request(conf: &config::WgConf) -> Result<String> {
+    let public_key = utils::b64_decode_to_hex(&conf.peer_key)?;
+    Ok(format!(
+        "set=1\nlisten_port=0\npublic_key={public_key}\nupdate_only=true\nendpoint={}\n\n",
+        conf.peer_address
+    ))
+}
+
 pub fn stop_wg_go() {
     stop_wg();
 }
@@ -123,11 +140,26 @@ pub fn start_wg_go_netstack(
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct UAPIClient {
     pub name: String,
 }
 
 impl UAPIClient {
+    fn call_uapi(&self, request: &[u8]) -> Result<String> {
+        let data = uapi(request).with_context(|| format!("call uapi for {}", self.name))?;
+        let response = String::from_utf8(data)
+            .with_context(|| format!("failed to decode uapi response for {}", self.name))?;
+        if !response.contains("errno=0") {
+            return Err(anyhow!(
+                "uapi for {} returned unexpected result: {}",
+                self.name,
+                response
+            ));
+        }
+        Ok(response)
+    }
+
     pub async fn config_wg(&mut self, conf: &config::WgConf) -> Result<()> {
         let mut buff = String::from("set=1\n");
         // standard wg-go uapi operations
@@ -206,6 +238,30 @@ impl UAPIClient {
             return Err(anyhow!("uapi returns unexpected result: {}", s));
         }
         Ok(())
+    }
+
+    /// Reopen the current WireGuard bind without destroying the TUN/netstack.
+    /// Setting an ephemeral listen port makes wireguard-go run BindUpdate,
+    /// which closes the stale UDP/TCP transport, opens a fresh one and clears
+    /// cached source addresses. Re-applying the peer endpoint then makes the
+    /// next active probe initiate a new handshake.
+    pub fn repair_transport(&self, conf: &config::WgConf) -> Result<()> {
+        let request = repair_transport_request(conf)?;
+        self.call_uapi(request.as_bytes())?;
+        Ok(())
+    }
+
+    pub async fn latest_handshake_age(&self) -> Result<Option<time::Duration>> {
+        let response = self.call_uapi(b"get=1\n\n")?;
+        let latest = latest_handshake_timestamp(&response);
+
+        let Some(timestamp) = latest else {
+            return Ok(None);
+        };
+        let now = chrono::Utc::now().timestamp();
+        Ok(Some(time::Duration::from_secs(
+            now.saturating_sub(timestamp) as u64,
+        )))
     }
 
     pub async fn check_wg_connection(&mut self) {
@@ -287,5 +343,84 @@ impl UAPIClient {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::WgConf;
+    use crate::utils;
+
+    use super::{
+        latest_handshake_timestamp, repair_transport_request, start_wg_go_netstack,
+        stop_wg_go, UAPIClient,
+    };
+
+    struct WgStopGuard;
+
+    impl Drop for WgStopGuard {
+        fn drop(&mut self) {
+            stop_wg_go();
+        }
+    }
+
+    fn dummy_wg_conf() -> WgConf {
+        let (public_key, private_key) = utils::gen_wg_keypair();
+        let (peer_key, _) = utils::gen_wg_keypair();
+        WgConf {
+            address: "100.64.0.2/32".to_string(),
+            address6: String::new(),
+            peer_address: "127.0.0.1:9".to_string(),
+            mtu: 1420,
+            public_key,
+            private_key,
+            peer_key,
+            allowed_ips: vec!["0.0.0.0/0".to_string()],
+            routes: Vec::new(),
+            dns: "1.1.1.1".to_string(),
+            protocol: 0,
+        }
+    }
+
+    #[test]
+    fn latest_handshake_timestamp_uses_newest_peer() {
+        let response = "private_key=x\nlast_handshake_time_sec=10\nlast_handshake_time_sec=30\nerrno=0\n\n";
+        assert_eq!(latest_handshake_timestamp(response), Some(30));
+    }
+
+    #[test]
+    fn transport_repair_rebinds_and_updates_only_existing_peer() {
+        let conf = WgConf {
+            address: String::new(),
+            address6: String::new(),
+            peer_address: "192.0.2.1:51820".to_string(),
+            mtu: 1420,
+            public_key: String::new(),
+            private_key: String::new(),
+            peer_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            allowed_ips: Vec::new(),
+            routes: Vec::new(),
+            dns: String::new(),
+            protocol: 0,
+        };
+
+        let request = repair_transport_request(&conf).unwrap();
+        assert!(request.starts_with("set=1\nlisten_port=0\n"));
+        assert!(request.contains("update_only=true\n"));
+        assert!(request.contains("endpoint=192.0.2.1:51820\n"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_repair_rebinds_a_live_netstack_device() {
+        let conf = dummy_wg_conf();
+        start_wg_go_netstack(&conf, "127.0.0.1:0", "", "", false).unwrap();
+        let _guard = WgStopGuard;
+        let mut uapi = UAPIClient {
+            name: "test-repair".to_string(),
+        };
+        uapi.config_wg_netstack(&conf).await.unwrap();
+
+        uapi.repair_transport(&conf).unwrap();
+        assert_eq!(uapi.latest_handshake_age().await.unwrap(), None);
     }
 }
