@@ -221,7 +221,7 @@ docker stop corplink-netfault
 - 握手超过阈值后返回。
 - `main` 随后执行 disconnect、清理路由/DNS 并退出。
 
-它没有社区 Web 方案中的以下能力：
+稳定版 `bytedance-6.5.2` 没有社区 Web 方案中的以下能力：
 
 1. DNS 与真实路径双信号探测。
 2. tunnel 与控制面 underlay 分离判断。
@@ -229,6 +229,24 @@ docker stop corplink-netfault
 4. 原地 RepairTransport。
 5. 候选连接先验证、后原子提交。
 6. 自动重建预算、冷却和并发恢复串行化。
+
+`preview/tunnel-recovery` 从 `bytedance-6.5.2` 分叉，已经加入第一版可测试实现：
+
+- 握手年龄 + 必须经过隧道的 HTTP 请求作为双信号；并非逐字复刻 Web 的 DNS/path
+  两个探针，但能避免仅凭握手时间误判。
+- 首次延迟 10 秒、每 5 秒探测、至少 3 次失败且窗口至少 30 秒、超过 90 秒断档重置。
+- 隧道双信号失败后单独探测控制面 underlay；underlay 失败时重置观察窗口并保留隧道。
+- transport repair 通过 UAPI 将 `listen_port` 设为新的临时端口，触发 wireguard-go
+  `BindUpdate`，同时以 `update_only` 重设现有 peer endpoint；随后主动验证最多 30 秒。
+- repair 失败后清理 TUN/DNS，并以同一 config/Cookie/device/key `exec` 新进程完成重建。
+- 用环境变量跨 `exec` 保留下一次允许完整重建的时间，默认冷却 10 分钟。
+- SOCKS5/netstack 的 HTTP 探测强制使用本机 `socks5h`，已用模拟 SOCKS 服务验证域名
+  确实交给隧道内 resolver，而不是宿主 DNS。
+
+这一版仍和社区实现有两个明确差异：它没有在旧连接存活时并行准备 candidate，也没有
+candidate 验证成功后的原子提交；full rebuild 是先安全撤销旧 TUN/DNS 再 `exec`，因此
+会有短暂中断。后续若要做到同等无缝切换，需要扩展 libwg，使同一进程能同时拥有带独立
+generation 的两个 device/netstack，而不是现在的全局单例 `wgDevice`。
 
 另外，macOS TUN 模式还必须独立处理系统级故障。即使移植上述恢复状态机，也不能让
 失效的 `utun` 路由或 VPN DNS 持续劫持整机网络。建议把实现拆为两个层次：
