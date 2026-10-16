@@ -22,10 +22,11 @@ use sha2::Digest;
 
 use crate::api::{ApiName, ApiUrl, CORPLINK_APP_VERSION, URL_GET_COMPANY};
 use crate::config::{
-    Config, WgConf, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1, PLATFORM_LARK, PLATFORM_LDAP,
+    Config, LoginFlow, WgConf, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1, PLATFORM_LARK, PLATFORM_LDAP,
     PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
 };
 use crate::qrcode::TerminalQrCode;
+use crate::device_login::{self, DeviceAuthorization};
 use crate::resp::*;
 use crate::sign;
 use crate::state::State;
@@ -286,11 +287,14 @@ impl Client {
             .parent()
             .unwrap_or_else(|| path::Path::new("."));
         let cookie_file = dir.join(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(false)
-            .truncate(true)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&cookie_file)
             .map(io::BufWriter::new)
             .with_context(|| {
@@ -313,6 +317,17 @@ impl Client {
         api: ApiName,
         body: Option<Map<String, Value>>,
     ) -> Result<Resp<T>> {
+        self.request_with_query(api, body, &[]).await
+    }
+
+    async fn request_with_query<T: DeserializeOwned + fmt::Debug>(
+        &mut self,
+        api: ApiName,
+        body: Option<Map<String, Value>>,
+        extra_query: &[(&str, &str)],
+    ) -> Result<Resp<T>> {
+        let device_auth = self.conf.login_flow == Some(LoginFlow::Device)
+            && api.supports_device_login();
         // body 不随重试变化：只序列化一次；body_bytes 借用 body_string，
         // 在整个函数生命周期内保持不变，循环内直接复用。
         let body_string: Option<String> = match &body {
@@ -330,6 +345,12 @@ impl Client {
             let url_str = self.api_url.get_api_url(&api);
             let mut url = Url::from_str(&url_str)
                 .with_context(|| format!("invalid api url {url_str} for {api:?}"))?;
+            if device_auth {
+                device_login::apply_profile(&mut url, self.current_timestamp());
+            }
+            if !extra_query.is_empty() {
+                url.query_pairs_mut().extend_pairs(extra_query.iter().copied());
+            }
 
             // The community Linux client timestamps only the signed list/connect
             // requests. Ping and disconnect report keep their minimal Android-v2
@@ -367,12 +388,22 @@ impl Client {
                     .body(b.clone()),
                 None => self.c.get(url.clone()),
             };
+            if device_auth {
+                rb = rb.header(header::USER_AGENT, device_login::USER_AGENT)
+                    .header(header::ACCEPT_LANGUAGE, "en");
+            }
 
             if !csrf.is_empty() {
                 rb = rb.header("csrf-token", &csrf);
             }
             if !cookie_str.is_empty() {
                 rb = rb.header(header::COOKIE, &cookie_str);
+            }
+            // The VPN endpoint reads the bit9 signing input from jwt-token.
+            // Freeze it with the Cookie snapshot used to compute Sign so token
+            // rotation cannot make the signature and transmitted header diverge.
+            if let Some(jwt) = signing_jwt.as_deref() {
+                rb = rb.header("jwt-token", jwt);
             }
             if let Some((name, value)) = sign_header {
                 log::debug!("signing {api:?} path={}", url.path());
@@ -385,6 +416,11 @@ impl Client {
                 .with_context(|| format!("request {api:?} failed"))?;
 
             if !resp.status().is_success() {
+                if device_auth {
+                    // A 429 or failed code exchange must not fall back to legacy
+                    // login or pretend that the partial session is authenticated.
+                    bail!("新版登录接口 {api:?} 返回 HTTP {}，请稍后重新登录", resp.status());
+                }
                 let msg = format!("logout because of bad resp code: {}", resp.status());
                 self.handle_logout_err(msg).await?;
             }
@@ -405,9 +441,8 @@ impl Client {
                 .with_context(|| format!("failed to read response body for api {api:?}"))?;
             // 先解析通用 envelope，避免错误响应的 data 结构与 T 不一致时
             // 在调用方看到业务错误码之前就反序列化失败。
-            let raw: Resp<Value> = serde_json::from_str(&text).with_context(|| {
-                format!("failed to parse response envelope for api {api:?}: {text}")
-            })?;
+            let raw: Resp<Value> = serde_json::from_str(&text)
+                .with_context(|| format!("failed to parse response envelope for api {api:?}"))?;
 
             // 签名时间戳过期错误：刷新后重试一次
             if is_signed && attempt == 0 && SIGN_RETRY_CODES.contains(&raw.code) {
@@ -428,7 +463,11 @@ impl Client {
                 data,
                 action: raw.action,
             };
-            log::debug!("api {:#?} resp: {:#?}", api, resp);
+            if device_auth {
+                log::debug!("api {api:?} response code={}", resp.code);
+            } else {
+                log::debug!("api {:#?} resp: {:#?}", api, resp);
+            }
             return Ok(resp);
         }
 
@@ -630,6 +669,9 @@ impl Client {
             .filter(|_| self.is_platform_or_default(method))
         {
             log::info!("try to login with third party platform {method}");
+            if resp.token.is_empty() {
+                bail!("服务器返回了新版设备登录方式，请设置 login_flow 为 device");
+            }
             return self
                 .get_otp_uri_from_tps(method, &resp.login_url, &resp.token)
                 .await;
@@ -720,6 +762,9 @@ impl Client {
 
     // choose right login method and login
     pub async fn login(&mut self) -> Result<()> {
+        if self.conf.login_flow == Some(LoginFlow::Device) {
+            return self.login_device().await;
+        }
         if self.conf.platform.as_deref() == Some(PLATFORM_CORPLINK_V1) {
             return self.login_v1().await;
         }
@@ -762,6 +807,157 @@ impl Client {
             return Ok(());
         }
         bail!("no available login method, please provide a valid platform")
+    }
+
+    async fn begin_device_login(&mut self) -> Result<DeviceAuthorization> {
+        let settings = self.get_login_method().await?;
+        let (verifier, challenge) = device_login::new_pkce();
+        let response = self
+            .request_with_query::<Vec<RespTpsLoginMethod>>(
+                ApiName::TpsLoginMethod,
+                None,
+                &[("code_challenge", challenge.as_str())],
+            )
+            .await?;
+        if response.code != 0 {
+            bail!("获取新版登录链接失败，错误码 {}", response.code);
+        }
+        let mut methods = response.data.context("新版登录接口未返回登录方式")?;
+        let platform = self.conf.platform.as_deref().filter(|s| !s.is_empty());
+        let index = match platform {
+            Some(platform) => methods.iter().position(|m| m.alias == platform),
+            None => settings
+                .login_orders
+                .iter()
+                .find_map(|name| methods.iter().position(|m| &m.alias == name)),
+        }
+        .context("找不到指定的第三方登录方式，请检查 platform 配置")?;
+        let method = methods.remove(index);
+        if method.alias_key.is_empty() {
+            bail!("服务器未提供新版设备认证链接，请检查 login_flow 配置");
+        }
+        let url = Url::parse(&method.login_url).context("invalid login URL")?;
+        if !matches!(url.scheme(), "https" | "http") {
+            bail!("服务器返回了不支持的登录链接协议");
+        }
+        Ok(DeviceAuthorization { method, verifier })
+    }
+
+    async fn exchange_device_callback(
+        &mut self,
+        authorization: &DeviceAuthorization,
+        callback: &str,
+    ) -> Result<RespDeviceLogin> {
+        let body = authorization.callback_body(
+            self.conf.server.as_deref().context("server missing")?,
+            callback,
+        )?;
+        let response = self
+            .request::<RespDeviceLogin>(ApiName::TpsDeviceCallback, Some(body))
+            .await?;
+        if response.code != 0 {
+            // Some deployments include the authorization code in their error text.
+            bail!(
+                "SSO 授权兑换失败，错误码 {}；授权码可能已过期，请重新运行登录",
+                response.code
+            );
+        }
+        let data = response.data.context("设备认证响应缺少 data")?;
+        if data.result != "success" {
+            bail!("设备认证未成功，请重新登录");
+        }
+        Ok(data)
+    }
+
+    async fn send_device_mfa(&mut self, kind: &str) -> Result<()> {
+        let response = self
+            .request::<Value>(
+                ApiName::LoginMfaSend,
+                Some(device_login::mfa_body(kind, None)),
+            )
+            .await?;
+        if response.code != 0 {
+            bail!("发送二次验证码失败，错误码 {}", response.code);
+        }
+        Ok(())
+    }
+
+    async fn verify_device_mfa(&mut self, kind: &str, code: &str) -> Result<RespDeviceLogin> {
+        if code.is_empty() {
+            bail!("验证码不能为空");
+        }
+        let response = self
+            .request::<RespDeviceLogin>(
+                ApiName::LoginMfaVerify,
+                Some(device_login::mfa_body(kind, Some(code))),
+            )
+            .await?;
+        if response.code != 0 {
+            bail!(
+                "二次验证失败，错误码 {}；请重新登录并核对验证码",
+                response.code
+            );
+        }
+        response.data.context("二次验证响应缺少 data")
+    }
+
+    async fn finish_device_login(&mut self, data: &RespDeviceLogin) -> Result<()> {
+        device_login::ensure_complete(data)?;
+        let otp_uri = self.request_otp_code().await?;
+        let secret = if otp_uri.is_empty() {
+            None
+        } else {
+            let url = Url::parse(&otp_uri).map_err(|_| anyhow!("服务器返回了无效的 OTP 地址"))?;
+            let secret = url
+                .query_pairs()
+                .find_map(|(k, v)| (k == "secret").then(|| v.into_owned()))
+                .filter(|s| !s.is_empty())
+                .context("OTP 地址缺少 secret")?;
+            utils::b32_decode(&secret).context("OTP secret 格式无效")?;
+            Some(secret)
+        };
+        self.conf.code = secret;
+        self.save_cookie()?;
+        self.change_state(State::Login).await?;
+        log::info!("新版设备登录完成，已保存新会话和 OTP 配置");
+        Ok(())
+    }
+
+    async fn login_device(&mut self) -> Result<()> {
+        let authorization = self.begin_device_login().await?;
+        println!(
+            "请在浏览器完成 {} 授权：\n{}",
+            authorization.method.alias, authorization.method.login_url
+        );
+        println!("授权完成后，如浏览器提示打开飞连，可取消该提示，复制地址栏的完整回调地址。");
+        device_login::open_browser(&authorization.method.login_url);
+        let callback = loop {
+            let input = device_login::read_input("请粘贴授权完成后的完整回调地址，然后按回车：")?;
+            match authorization.callback_body(self.conf.server.as_deref().unwrap_or(""), &input) {
+                Ok(_) => break input,
+                Err(error) => eprintln!("{error}"),
+            }
+        };
+        let mut data = self
+            .exchange_device_callback(&authorization, &callback)
+            .await?;
+        if let Some(next) = data.next.as_ref().filter(|next| next.action == "2FA") {
+            let kind = ["email", "mobile", "otp"]
+                .into_iter()
+                .find(|kind| next.auth_list.iter().any(|method| method == kind))
+                .context("服务器要求的二次验证方式暂不支持，未完成登录")?;
+            let prompt = match kind {
+                "email" => "邮箱验证码已发送，请输入验证码后按回车：",
+                "mobile" => "短信验证码已发送，请输入验证码后按回车：",
+                _ => "请输入动态验证码后按回车：",
+            };
+            if kind != "otp" {
+                self.send_device_mfa(kind).await?;
+            }
+            let code = device_login::read_input(prompt)?;
+            data = self.verify_device_mfa(kind, &code).await?;
+        }
+        self.finish_device_login(&data).await
     }
 
     async fn get_login_method(&mut self) -> Result<RespLoginMethod> {
@@ -1299,8 +1495,7 @@ impl Client {
             &mut selected_vpn.set_cookie_headers.iter(),
             &endpoint_url,
         );
-        // `/vpn/conn` 的签名直接使用选中节点当前的 vpn-token Cookie；
-        // 社区 Linux 客户端不另外发送 jwt-token 请求头。
+        // `/vpn/conn` 的签名与 jwt-token 请求头都使用选中节点当前的 vpn-token Cookie。
         self.save_cookie()?;
         let vpn_addr = match vpn.ip.parse::<IpAddr>() {
             Ok(ip) => SocketAddr::new(ip, vpn.vpn_port).to_string(),
@@ -1650,8 +1845,17 @@ mod tests {
                 break;
             }
             request.extend_from_slice(&buffer[..count]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
+            if let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+            {
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let body_len = request_header(headers, "content-length")
+                    .map(|value| value.parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + body_len {
+                    break;
+                }
             }
         }
         String::from_utf8(request).unwrap()
@@ -1692,7 +1896,8 @@ mod tests {
         let url = Url::parse(&format!("http://localhost{target}")).unwrap();
         let cookie = request_header(request, "cookie").unwrap_or("");
         let csrf = request_header(request, "csrf-token").unwrap_or("");
-        let jwt = cookie_value(cookie, "vpn-token").unwrap_or("");
+        let jwt = request_header(request, "jwt-token").unwrap_or("");
+        let body = request.split_once("\r\n\r\n").unwrap().1.as_bytes();
         let actual = request_header(request, sign::SIGN_HEADER).expect("missing Sign header");
         let mask = sign::sign_mask_by_path(url.path()).expect("path should be signed");
         let expected = sign::compute_sign(
@@ -1701,7 +1906,7 @@ mod tests {
             method,
             url.path(),
             url.query().unwrap_or(""),
-            b"",
+            body,
             cookie,
             csrf,
             jwt,
@@ -1792,6 +1997,196 @@ mod tests {
             .insert_raw(&RawCookie::new("csrf-token", "fresh-csrf"), &server_url)
             .unwrap();
         client
+    }
+
+    #[tokio::test]
+    async fn device_login_exchanges_pkce_completes_mfa_and_persists_only_completed_state() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use sha2::{Digest, Sha256};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let paths = [
+                "/api/login/setting",
+                "/api/tpslogin/link",
+                "/api/tpslogin/device/callback",
+                "/api/v1/login/mfa/send",
+                "/api/v1/login/mfa/verify",
+                "/api/v2/p/otp",
+            ];
+            let mut challenge = String::new();
+            for (step, path) in paths.iter().enumerate() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let target = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let url = Url::parse(&format!("http://localhost{target}")).unwrap();
+                assert_eq!(url.path(), *path);
+                let query: std::collections::HashMap<_, _> =
+                    url.query_pairs().into_owned().collect();
+                assert_eq!(query["os"], "Android");
+                assert_eq!(query["os_version"], "27");
+                assert_eq!(query["app_version"], "3.3.23");
+                assert_eq!(query["build_number"], "2442");
+                assert!(query["timestamp"].parse::<i64>().unwrap() > 0);
+                assert_eq!(
+                    request_header(&request, "user-agent"),
+                    Some(crate::device_login::USER_AGENT)
+                );
+                assert_eq!(request_header(&request, "accept-language"), Some("en"));
+                let cookie = request_header(&request, "cookie").unwrap_or("");
+                assert!(cookie.contains("device_id=test-device"));
+                assert_eq!(request_header(&request, "sign"), None);
+                if step < 3 {
+                    assert!(!cookie.contains("session="));
+                }
+                if (3..5).contains(&step) {
+                    assert!(cookie.contains("session=partial-session"));
+                    assert_eq!(request_header(&request, "csrf-token"), Some("partial-csrf"));
+                }
+                let body = if step >= 2 {
+                    serde_json::from_str::<serde_json::Value>(
+                        request.split_once("\r\n\r\n").unwrap().1,
+                    )
+                    .unwrap()
+                } else {
+                    serde_json::Value::Null
+                };
+                let (data, cookies) = match step {
+                    0 => (
+                        json!({"login_enable":true,"login_enable_ldap":false,"login_orders":["mobile_auth","lark","bytedance_sso"]}),
+                        "Set-Cookie: journey=auth-journey; Path=/\r\n",
+                    ),
+                    1 => {
+                        assert!(cookie.contains("journey=auth-journey"));
+                        challenge = query["code_challenge"].clone();
+                        (
+                            json!([{"alias":"bytedance_sso","alias_key":"bytedance_sso","login_url":"https://sso.example.com/authorize?state=this-attempt"}]),
+                            "",
+                        )
+                    }
+                    2 => {
+                        assert_eq!(body["alias_key"], "bytedance_sso");
+                        assert_eq!(body["code"], "fresh-code");
+                        assert_eq!(body["state"], "this-attempt");
+                        assert_eq!(
+                            URL_SAFE_NO_PAD.encode(Sha256::digest(
+                                body["code_verifier"].as_str().unwrap().as_bytes()
+                            )),
+                            challenge
+                        );
+                        (json!({"result":"success","next":{"action":"2FA","auth_list":["email"]}}),
+                            "Set-Cookie: session=partial-session; Path=/; Max-Age=3600\r\nSet-Cookie: csrf-token=partial-csrf; Path=/; Max-Age=3600\r\n")
+                    }
+                    3 => {
+                        assert_eq!(
+                            body,
+                            json!({"login_scene":"feilian","mfa_type":"email","account":""})
+                        );
+                        (json!({}), "")
+                    }
+                    4 => {
+                        assert_eq!(
+                            body,
+                            json!({"login_scene":"feilian","mfa_type":"email","account":"","code":"123456"})
+                        );
+                        (json!({"result":"success","next":{"action":"GoToLink"}}),
+                            "Set-Cookie: session=fresh-session; Path=/; Max-Age=3600\r\nSet-Cookie: csrf-token=fresh-csrf; Path=/; Max-Age=3600\r\n")
+                    }
+                    _ => {
+                        assert!(cookie.contains("session=fresh-session"));
+                        assert!(!cookie.contains("partial-session"));
+                        assert_eq!(request_header(&request, "csrf-token"), Some("fresh-csrf"));
+                        (
+                            json!({"url":"otpauth://totp/test?secret=JBSWY3DPEHPK3PXP","code":""}),
+                            "",
+                        )
+                    }
+                };
+                let response_body = json!({"code":0,"data":data}).to_string();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{cookies}Connection: close\r\n\r\n{response_body}", response_body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut client = test_client();
+        client.conf.server = Some(format!("http://{address}"));
+        client.conf.login_flow = Some(crate::config::LoginFlow::Device);
+        client.conf.platform = Some("bytedance_sso".into());
+        client.api_url = ApiUrl::new(&client.conf).unwrap();
+        *client.cookie.lock().unwrap() = CookieStore::default();
+        client
+            .cookie
+            .lock()
+            .unwrap()
+            .insert_raw(
+                &RawCookie::new("device_id", "test-device"),
+                &Url::parse(client.conf.server.as_ref().unwrap()).unwrap(),
+            )
+            .unwrap();
+        let authorization = client.begin_device_login().await.unwrap();
+        let data = client.exchange_device_callback(&authorization,
+            "corplink://login/callback?alias_key=bytedance_sso&code=fresh-code&state=this-attempt").await.unwrap();
+        assert!(client.need_login());
+        assert!(client.finish_device_login(&data).await.is_err());
+        assert!(client.need_login());
+        client.send_device_mfa("email").await.unwrap();
+        let data = client.verify_device_mfa("email", "123456").await.unwrap();
+        assert!(client.need_login());
+        client.finish_device_login(&data).await.unwrap();
+        assert!(!client.need_login());
+        assert_eq!(client.conf.code.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+        assert!(client
+            .api_url
+            .get_api_url(&ApiName::ListVPN)
+            .contains("os=Linux"));
+        let restored = Client::new(client.conf.clone()).unwrap();
+        assert!(restored
+            .cookie_header_for(&Url::parse(client.conf.server.as_ref().unwrap()).unwrap())
+            .unwrap()
+            .contains("session=fresh-session"));
+        server.await.unwrap();
+        let config_path = std::path::Path::new(client.conf.conf_file.as_ref().unwrap());
+        let cookie_path = config_path.parent().unwrap().join(format!(
+            "{}_cookies.json",
+            client.conf.interface_name.as_ref().unwrap()
+        ));
+        std::fs::remove_file(config_path).unwrap();
+        std::fs::remove_file(cookie_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_device_mfa_and_throttled_auth_do_not_mark_client_logged_in() {
+        let mut client = test_client();
+        client.conf.login_flow = Some(crate::config::LoginFlow::Device);
+        let (port, _request, server) =
+            start_response_server(r#"{"code":101,"message":"wrong code"}"#).await;
+        client.conf.server = Some(format!("http://127.0.0.1:{port}"));
+        client.api_url = ApiUrl::new(&client.conf).unwrap();
+        assert!(client.verify_device_mfa("email", "123456").await.is_err());
+        assert!(client.need_login());
+        assert!(client.conf.code.is_none());
+        server.await.unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        client.conf.server = Some(format!("http://{address}"));
+        client.api_url = ApiUrl::new(&client.conf).unwrap();
+        let error = client.begin_device_login().await.err().unwrap().to_string();
+        assert!(error.contains("429"));
+        assert!(!error.contains("logout"));
+        assert!(client.need_login());
+        server.await.unwrap();
     }
 
     #[test]
@@ -2045,7 +2440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_request_matches_community_linux_wire_shape() {
+    async fn connect_request_sends_jwt_header_matching_cookie_and_signature() {
         let (port, request_rx, server_task) =
             start_response_server(r#"{"code":0,"data":{}}"#).await;
         let mut client = test_client();
@@ -2074,11 +2469,12 @@ mod tests {
         assert!(request_line.contains("&soc="));
         assert!(request_line.contains("&timestamp="));
         assert!(request_header(&request, sign::SIGN_HEADER).is_some());
-        assert!(request_header(&request, "jwt-token").is_none());
+        assert_eq!(request_header(&request, "jwt-token"), Some("token-a"));
         assert_eq!(
             request_header(&request, "cookie").and_then(|value| cookie_value(value, "vpn-token")),
             Some("token-a")
         );
+        assert_valid_wire_signature(&request, "test", "test-device");
         let body = request
             .split_once("\r\n\r\n")
             .map(|(_, body)| body)
@@ -2329,7 +2725,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_signature_uses_vpn_cookie_without_jwt_header_state() {
+    fn connect_signature_uses_current_vpn_cookie() {
         let client = sign_test_client(sign_test_config(Some("dev-123")));
         let url = Url::parse("https://example.com/vpn/conn?timestamp=1700000000").unwrap();
         client

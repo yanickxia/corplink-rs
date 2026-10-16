@@ -40,6 +40,102 @@ pub enum RouteMode {
     Full,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginFlow {
+    Legacy,
+    Device,
+}
+
+fn default_tunnel_probe_url() -> String {
+    "https://code.byted.org/".to_string()
+}
+
+fn default_initial_delay_secs() -> u64 {
+    10
+}
+
+fn default_probe_interval_secs() -> u64 {
+    5
+}
+
+fn default_probe_timeout_secs() -> u64 {
+    5
+}
+
+fn default_handshake_stale_secs() -> u64 {
+    180
+}
+
+fn default_min_failures() -> u32 {
+    3
+}
+
+fn default_min_failure_window_secs() -> u64 {
+    30
+}
+
+fn default_reset_gap_secs() -> u64 {
+    90
+}
+
+fn default_repair_delay_secs() -> u64 {
+    10
+}
+
+fn default_repair_timeout_secs() -> u64 {
+    6
+}
+
+fn default_repair_validation_secs() -> u64 {
+    30
+}
+
+fn default_rebuild_cooldown_secs() -> u64 {
+    10 * 60
+}
+
+/// Opt-in tunnel availability detection and recovery. Keeping the whole block
+/// absent preserves the stable 6.5.2 lifecycle.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TunnelRecoveryConfig {
+    /// Defaults to true when the `tunnel_recovery` block is present.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// An application URL which must be reachable through the tunnel.
+    #[serde(default = "default_tunnel_probe_url")]
+    pub tunnel_probe_url: String,
+    /// Direct-network/control-plane URL used to distinguish tunnel failure
+    /// from a general network outage. Defaults to the configured CorpLink server.
+    pub underlay_probe_url: Option<String>,
+    #[serde(default = "default_initial_delay_secs")]
+    pub initial_delay_secs: u64,
+    #[serde(default = "default_probe_interval_secs")]
+    pub probe_interval_secs: u64,
+    #[serde(default = "default_probe_timeout_secs")]
+    pub probe_timeout_secs: u64,
+    #[serde(default = "default_handshake_stale_secs")]
+    pub handshake_stale_secs: u64,
+    #[serde(default = "default_min_failures")]
+    pub min_failures: u32,
+    #[serde(default = "default_min_failure_window_secs")]
+    pub min_failure_window_secs: u64,
+    #[serde(default = "default_reset_gap_secs")]
+    pub reset_gap_secs: u64,
+    #[serde(default = "default_repair_delay_secs")]
+    pub repair_delay_secs: u64,
+    #[serde(default = "default_repair_timeout_secs")]
+    pub repair_timeout_secs: u64,
+    #[serde(default = "default_repair_validation_secs")]
+    pub repair_validation_secs: u64,
+    #[serde(default = "default_rebuild_cooldown_secs")]
+    pub rebuild_cooldown_secs: u64,
+}
+
 impl fmt::Display for RouteMode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -55,6 +151,8 @@ pub struct Config {
     pub username: String,
     pub password: Option<String>,
     pub platform: Option<String>,
+    /// Opt in to the Android PKCE device callback and login MFA flow.
+    pub login_flow: Option<LoginFlow>,
     pub code: Option<String>,
     pub device_name: Option<String>,
     pub device_id: Option<String>,
@@ -70,6 +168,7 @@ pub struct Config {
     pub vpn_select_strategy: Option<String>,
     pub use_vpn_dns: Option<bool>,
     pub dns_backup_filename: Option<String>,
+    /// Install system routes (default: true), independently of SOCKS5 listening.
     pub auto_setup_routes: Option<bool>,
     /// "split" (default) or "full". Selects which route list from the server to apply.
     pub route_mode: Option<RouteMode>,
@@ -87,10 +186,9 @@ pub struct Config {
     /// Useful in full mode to punch holes for local LAN or the VPN peer IP itself,
     /// avoiding routing loops (e.g. 192.168.1.0/24, 10.0.0.5/32).
     pub vpn_disallowed_routes: Option<Vec<String>>,
-    /// When set, run entirely in userspace (gVisor netstack) and expose a SOCKS5
-    /// proxy at this listen address (e.g. "0.0.0.0:1080" or "127.0.0.1:1080")
-    /// instead of creating a kernel TUN device. No system interface, routes, DNS
-    /// changes or root privileges are required. Only TCP CONNECT is supported.
+    /// Optional SOCKS5 listener. With auto_setup_routes enabled, shares the kernel
+    /// TUN and VPN DNS with system traffic. With auto_setup_routes=false, runs in
+    /// userspace netstack without system routes, DNS changes, or root privileges.
     pub socks5_listen: Option<String>,
     /// Optional SOCKS5 username/password authentication (RFC 1929). When
     /// `socks5_username` is set and non-empty, clients must authenticate with
@@ -113,6 +211,8 @@ pub struct Config {
     /// "userid". Deployments whose login setting advertises a different
     /// account type (e.g. "email") can override it here.
     pub account_type: Option<String>,
+    /// Opt-in corplink-web-style tunnel detection and recovery.
+    pub tunnel_recovery: Option<TunnelRecoveryConfig>,
 }
 
 impl fmt::Display for Config {
@@ -125,6 +225,10 @@ impl fmt::Display for Config {
 }
 
 impl Config {
+    pub fn uses_netstack(&self) -> bool {
+        self.socks5_listen.is_some() && !self.auto_setup_routes.unwrap_or(true)
+    }
+
     pub async fn from_file(file: &str) -> Result<Config> {
         let conf_str = fs::read_to_string(file)
             .await
@@ -207,4 +311,54 @@ pub struct WgConf {
 
     // corplink confs
     pub protocol: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socks_listener_does_not_override_system_route_setting() {
+        for socks in [None, Some("127.0.0.1:1080")] {
+            for routes in [None, Some(true), Some(false)] {
+                let config: Config = serde_json::from_value(serde_json::json!({
+                    "company_name":"test", "username":"test",
+                    "socks5_listen":socks, "auto_setup_routes":routes,
+                })).unwrap();
+                assert_eq!(config.uses_netstack(), socks.is_some() && routes == Some(false));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_block_is_opt_in() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "company_name": "test",
+            "username": "test"
+        }))
+        .unwrap();
+        assert!(config.tunnel_recovery.is_none());
+    }
+
+    #[test]
+    fn empty_recovery_block_uses_community_thresholds() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "company_name": "test",
+            "username": "test",
+            "tunnel_recovery": {}
+        }))
+        .unwrap();
+        let recovery = config.tunnel_recovery.unwrap();
+
+        assert!(recovery.enabled);
+        assert_eq!(recovery.tunnel_probe_url, "https://code.byted.org/");
+        assert_eq!(recovery.initial_delay_secs, 10);
+        assert_eq!(recovery.probe_interval_secs, 5);
+        assert_eq!(recovery.min_failures, 3);
+        assert_eq!(recovery.min_failure_window_secs, 30);
+        assert_eq!(recovery.reset_gap_secs, 90);
+        assert_eq!(recovery.repair_delay_secs, 10);
+        assert_eq!(recovery.repair_timeout_secs, 6);
+        assert_eq!(recovery.rebuild_cooldown_secs, 600);
+    }
 }

@@ -338,6 +338,10 @@ def h1_feed(ssl, d, buf):
             st["clen"] = int(hdrs.get("content-length", "0") or 0)
             st["body"] = bytearray()
             st["phase"] = "chunk" if st["chunked"] else "body"
+            # A bodyless GET often ends at the header delimiter. Finalize it
+            # now so its response cannot be paired with the previous request.
+            if not st["chunked"] and st["clen"] == 0:
+                _h1_complete(ssl, d, st)
         elif st["phase"] == "body":
             need = st["clen"] - len(st["body"])
             if need <= 0:

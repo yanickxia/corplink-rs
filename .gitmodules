@@ -1,4 +1,4 @@
 [submodule "libwg/wireguard-go"]
 	path = libwg/wireguard-go
-	url = https://github.com/PinkD/wireguard-go
-	branch = libwg
+	url = https://github.com/yanickxia/wireguard-go
+	branch = corplink/tun-socks5
