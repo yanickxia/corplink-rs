@@ -2,16 +2,16 @@
 
 pkgname=corplink-rs
 _pkgbase=corplink-rs
-pkgver=6.5.0
+pkgver=6.6.0
 pkgrel=1
 pkgdesc='Corplink client written in Rust'
 arch=('i686' 'x86_64')
 url='https://github.com/yanickxia/corplink-rs'
 license=('GPL-2.0-only')
-makedepends=('cargo' 'go' 'clang')
+makedepends=('cargo' 'go' 'clang' 'git')
 source=(
   "$pkgname.$pkgver.tar.gz"::"https://github.com/yanickxia/corplink-rs/archive/refs/tags/bytedance-$pkgver.tar.gz"
-  "wireguard-go"::"git+https://github.com/PinkD/wireguard-go"
+  "wireguard-go"::"git+https://github.com/yanickxia/wireguard-go#commit=a73b9f07989a647ad7f4d84184efb3b1b8ea77a4"
 )
 
 # use SKIP to avoid update PKGBUILD everytime
@@ -29,7 +29,7 @@ build() {
 
   # build corplink-rs
   cd "$srcdir/$_pkgbase-bytedance-$pkgver"
-  cargo build --release
+  cargo build --locked --release
 }
 
 package() {
