@@ -1,6 +1,6 @@
 [package]
 name = "corplink-rs"
-version = "6.6.0-preview.1"
+version = "6.6.0"
 edition = "2021"
 
 [dependencies]
