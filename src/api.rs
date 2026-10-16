@@ -37,6 +37,9 @@ pub enum ApiName {
     LoginMethod,
     TpsLoginMethod,
     TpsTokenCheck,
+    TpsDeviceCallback,
+    LoginMfaSend,
+    LoginMfaVerify,
     CorplinkLoginMethod,
     RequestEmailCode,
     LoginPassword,
@@ -49,6 +52,13 @@ pub enum ApiName {
     DisconnectVPN,
     Otp,
     Logout,
+}
+
+impl ApiName {
+    pub fn supports_device_login(&self) -> bool {
+        matches!(self, Self::LoginMethod | Self::TpsLoginMethod | Self::TpsDeviceCallback
+            | Self::LoginMfaSend | Self::LoginMfaVerify | Self::Otp)
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -152,6 +162,13 @@ impl ApiUrl {
             ApiName::TpsTokenCheck,
             Template::new(URL_GET_TPS_TOKEN_CHECK),
         );
+        for (name, url) in [
+            (ApiName::TpsDeviceCallback, "{{url}}/api/tpslogin/device/callback"),
+            (ApiName::LoginMfaSend, "{{url}}/api/v1/login/mfa/send"),
+            (ApiName::LoginMfaVerify, "{{url}}/api/v1/login/mfa/verify"),
+        ] {
+            api_template.insert(name, Template::new(url));
+        }
         api_template.insert(
             ApiName::CorplinkLoginMethod,
             Template::new(URL_GET_CORPLINK_LOGIN_METHOD),
@@ -206,6 +223,9 @@ impl ApiUrl {
             ApiName::LoginMethod => self.api_template[name].render(user_param),
             ApiName::TpsLoginMethod => self.api_template[name].render(user_param),
             ApiName::TpsTokenCheck => self.api_template[name].render(user_param),
+            ApiName::TpsDeviceCallback | ApiName::LoginMfaSend | ApiName::LoginMfaVerify => {
+                self.api_template[name].render(user_param)
+            }
             ApiName::CorplinkLoginMethod => self.api_template[name].render(user_param),
             ApiName::RequestEmailCode => self.api_template[name].render(user_param),
             ApiName::LoginEmail => self.api_template[name].render(user_param),

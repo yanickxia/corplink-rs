@@ -33,7 +33,25 @@ pub struct RespLoginMethod {
 pub struct RespTpsLoginMethod {
     pub alias: String,
     pub login_url: String,
+    #[serde(default)]
     pub token: String,
+    #[serde(default)]
+    pub alias_key: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+pub struct RespDeviceLogin {
+    pub result: String,
+    #[serde(default)]
+    pub next: Option<DeviceLoginNext>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+pub struct DeviceLoginNext {
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub auth_list: Vec<String>,
 }
 
 #[derive(serde::Deserialize, Debug)]

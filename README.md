@@ -220,9 +220,9 @@ RUST_LOG=debug ./corplink-rs config.json
   // VPN, and for excluding the VPN peer endpoint IP to avoid a routing loop
   // that would otherwise black-hole all traffic.
   "vpn_disallowed_routes": ["192.168.1.0/24"],
-  // optional: run entirely in userspace (gVisor netstack) and expose a SOCKS5
-  // proxy at this address instead of creating a kernel TUN device. No system
-  // interface, routes, DNS changes or root privileges are required.
+  // optional: expose SOCKS5 alongside system routes using the same VPN tunnel.
+  // set auto_setup_routes=false for userspace-only SOCKS5 without root or
+  // system interface/routes/DNS changes.
   // supports TCP CONNECT and UDP ASSOCIATE; hostnames are resolved in-tunnel.
   "socks5_listen": "0.0.0.0:1080",
   // optional: require SOCKS5 username/password auth (RFC 1929) on the proxy.
@@ -239,21 +239,95 @@ RUST_LOG=debug ./corplink-rs config.json
   // poll the TPS auth result until approval (5s interval, 180s timeout) instead
   // of waiting for Enter; opt-in because some servers invalidate the auth
   // ticket on the first check
-  "poll_tps_auth": false
+  "poll_tps_auth": false,
+  // preview: opt-in corplink-web-style availability detection and recovery.
+  // The block being absent keeps the stable 6.5.2 lifecycle. An empty object
+  // enables defaults; override the URLs when code.byted.org is not the correct
+  // tunnel-only target for your company.
+  "tunnel_recovery": {
+    "enabled": true,
+    "tunnel_probe_url": "https://code.byted.org/",
+    // Defaults to the configured CorpLink server. In full-tunnel mode, choose
+    // a URL/IP excluded from AllowedIPs so this really tests underlay.
+    "underlay_probe_url": "https://corplink.example.com/",
+    "initial_delay_secs": 10,
+    "probe_interval_secs": 5,
+    "probe_timeout_secs": 5,
+    "handshake_stale_secs": 180,
+    "min_failures": 3,
+    "min_failure_window_secs": 30,
+    "reset_gap_secs": 90,
+    "repair_delay_secs": 10,
+    "repair_timeout_secs": 6,
+    "repair_validation_secs": 30,
+    "rebuild_cooldown_secs": 600
+  }
 }
 ```
+
+## 新版 SSO 设备登录
+
+支持 Android 3.3.23 使用的 PKCE 设备登录流程。配置 `"login_flow": "device"`，
+并把 `platform` 设为服务器提供的登录方式，例如 `bytedance_sso` 或 `lark`。
+省略 `login_flow` 时继续使用旧流程。
+
+```json
+{
+  "company_name": "company code name",
+  "username": "your_name",
+  "server": "https://your-corplink-server.example.com",
+  "login_flow": "device",
+  "platform": "bytedance_sso",
+  "device_id": "your registered device id",
+  "device_name": "your registered device name",
+  "interface_name": "fresh-login",
+  "socks5_listen": "127.0.0.1:15323",
+  "auto_setup_routes": false,
+  "state": "Init"
+}
+```
+
+运行后程序会打开浏览器。完成 SSO 授权后，复制地址栏中
+`/multiple-pages/device-callback.html?...` 的完整地址并粘贴到终端；
+也接受 `corplink://login/callback?...` 地址。若浏览器提示打开飞连，可取消提示后复制地址。
+回调地址仅供本次登录使用，请及时粘贴，不要分享或写入配置文件。
+
+如果服务器要求二次验证，程序优先发送邮箱验证码，其次支持短信和动态验证码。
+按终端提示输入验证码后，程序获取 OTP 并保存新会话，再连接 VPN。
+未完成 MFA 或服务器要求其他尚不支持的步骤时，程序会停止，配置不会标记为已登录。
+此流程仍须满足企业的账号、设备信任和二次验证要求。
+
+从头测试时，使用独立目录或独立 `interface_name`，设 `state` 为 `Init`，
+清空 `code`，并确保对应的 `<interface_name>_cookies.json` 不存在。
+纯 SOCKS5 模式（`auto_setup_routes=false`）无需 sudo，也不会改系统路由或 DNS。
 
 ## CorpLink request profile
 
 The VPN control plane follows the community Linux client profile: list/connect
-use CorpLink 3.3.17 build 8135 and are signed, while ping and the best-effort
-disconnect report use the minimal Android-v2 query and are unsigned. The client
+use CorpLink 3.3.17 build 8135 and are signed. Connect also sends `jwt-token`
+from the same `vpn-token` Cookie snapshot used to compute the signature.
+Ping and the best-effort disconnect report use the minimal Android-v2 query and
+are unsigned. The client
 does not send periodic `/vpn/report` requests; tunnel liveness is determined by
 WireGuard handshakes and persistent keepalive.
 
 ## SOCKS5 / netstack 模式
 
-设置 `socks5_listen` 后，corplink-rs 不再创建内核 TUN 网卡，而是用 [wg-go][2] 的 gVisor netstack 在用户态跑 WireGuard，并在该地址上暴露一个 SOCKS5 代理：
+`socks5_listen` 控制是否监听 SOCKS5；`auto_setup_routes` 独立控制是否自动安装系统路由：
+
+| `socks5_listen` | `auto_setup_routes` | 行为 |
+|---|---|---|
+| 未设置 | `true` / `null` / 未设置 | 创建 TUN，自动安装路由 |
+| 未设置 | `false` | 创建 TUN，路由由用户配置 |
+| 已设置 | `true` / `null` / 未设置 | 创建 TUN、自动安装路由，同时提供 SOCKS5 |
+| 已设置 | `false` | 纯用户态 SOCKS5，不创建系统 TUN 或安装路由 |
+
+系统 TUN 与 SOCKS5 共用一个 WireGuard 连接。SOCKS5 出站连接绑定到 VPN 网卡，
+只允许访问 WireGuard AllowedIPs 范围内的目标，域名通过 VPN 提供的 DNS 解析。
+系统路由模式需要 root / 管理员权限，系统 DNS 由 `use_vpn_dns` 控制。
+
+如果需要原来的免 root 纯代理模式，请显式设置 `auto_setup_routes=false`。
+这种模式使用 [wg-go][2] 的 gVisor netstack：
 
 - **无需 root / 不改系统路由和 DNS / 不建网卡**，适合容器、无权限环境或只想给单个应用走 VPN 的场景
 - 支持 TCP `CONNECT` 和 UDP `ASSOCIATE`，域名在隧道内解析（用 `--socks5-hostname` 让客户端把 DNS 也交给代理）
@@ -264,7 +338,22 @@ WireGuard handshakes and persistent keepalive.
 curl --socks5-hostname user:pass@127.0.0.1:1080 https://intranet.example.com/
 ```
 
-此模式下 `interface_name`、`use_vpn_dns`、`auto_setup_routes` 等与系统网卡/路由相关的设置不生效。
+纯用户态模式下，`interface_name` 用于区分 Cookie 文件，不创建系统网卡；`use_vpn_dns` 不改变系统 DNS。
+
+## Preview tunnel recovery
+
+`preview/tunnel-recovery` 分支新增一套显式启用的恢复监督器。它同时检查最近的
+WireGuard 握手年龄和必须经过隧道的 HTTP 请求；只有两个信号都至少失败 3 次、
+失败窗口达到 30 秒，且控制面/underlay 仍可访问时，才会接受恢复请求。
+
+恢复会先等待 10 秒，通过 UAPI 重新打开当前 WireGuard UDP/TCP bind 并重设 peer
+endpoint，再主动验证最多 30 秒。仍未恢复时，它先清理 TUN/DNS，再用同一份配置、
+Cookie、device ID 和 WireGuard key `exec` 一个全新进程。完整重建在 `exec` 前后共享
+10 分钟冷却预算，持续故障不会造成重启风暴；underlay 也不可用时则保留当前隧道。
+
+SOCKS5/netstack 模式下，隧道 HTTP 探测自动通过本机 SOCKS5 监听，并使用远端 DNS
+（`socks5h`）；内核 TUN 模式沿用 AllowedIPs/系统路由。在 full-tunnel 模式下，要让
+underlay 判断可信，应通过 `vpn_disallowed_routes` 明确排除 underlay 探测地址。
 
 # 原理和分析
 
