@@ -25,3 +25,7 @@ libwg/libwg.h
 # local TLS capture output and Python bytecode
 /capture.*
 __pycache__/
+
+# Docker runtime settings and persistent login state
+/.env
+/docker/data/

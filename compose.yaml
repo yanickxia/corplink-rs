@@ -1,0 +1,28 @@
+services:
+  corplink:
+    image: "${CORPLINK_IMAGE:-ghcr.io/yanickxia/corplink-rs-dev:dev}"
+    user: "${CORPLINK_UID:-10001}:${CORPLINK_GID:-10001}"
+    environment:
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - type: bind
+        source: ./docker/data
+        target: /config
+        bind:
+          create_host_path: false
+    ports:
+      - "${CORPLINK_BIND_ADDRESS:-127.0.0.1}:${CORPLINK_SOCKS_PORT:-1080}:1080/tcp"
+    # Keep stdin available for SSO callbacks / MFA via `docker compose attach`.
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,19 @@
+# Allow only build inputs. Never send local configs, cookies, captures or binaries.
+**
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!src/**
+!libwg/
+!libwg/wireguard-go/
+!libwg/wireguard-go/**
+!docker/
+!docker/entrypoint.sh
+**/.git
+**/.git/**
+**/.DS_Store
+**/version.go
+**/libwg.a
+**/libwg.h
+libwg/wireguard-go/wireguard-go

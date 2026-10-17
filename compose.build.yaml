@@ -1,0 +1,5 @@
+services:
+  corplink:
+    image: "${CORPLINK_IMAGE:-corplink-rs-dev:local}"
+    build:
+      context: .

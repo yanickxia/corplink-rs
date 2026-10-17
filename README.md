@@ -20,6 +20,157 @@
 
 可以从 [nightly.link](https://nightly.link/PinkD/corplink-rs/workflows/release/master) 下载
 
+## Docker 部署（dev，SOCKS5 代理）
+
+需要 Docker Engine 和 Compose 插件。默认部署纯用户态 SOCKS5，容器以普通用户运行，
+不需要 `/dev/net/tun`、`NET_ADMIN` 或 privileged。代理不会修改服务器系统路由。
+
+### 拉取镜像和准备配置
+
+CI 发布到 `ghcr.io/yanickxia/corplink-rs-dev`，一个标签同时提供 `linux/amd64` 和
+`linux/arm64`，服务器拉取时自动选择架构。首次 CI 发布成功后，在 `dev` 分支仓库根目录执行：
+
+```sh
+docker compose pull
+
+mkdir -p docker/data
+cp docker/config.example.json docker/data/config.json
+chmod 700 docker/data
+chmod 600 docker/data/config.json
+```
+
+Compose 默认拉取 `ghcr.io/yanickxia/corplink-rs-dev:dev`。可在 `.env` 中设置
+`CORPLINK_IMAGE=ghcr.io/yanickxia/corplink-rs-dev:6.6.0` 等已发布版本来固定镜像。
+镜像只包含 Linux release 程序和运行库，不含本机配置、Cookie 或编译工具链。
+
+GHCR 新包首次发布时默认是私有的。需要匿名拉取时，在 GitHub Packages 的包设置中
+将其设为 Public；保留私有时，服务器先用拥有 `read:packages` 权限的 classic PAT 执行
+`docker login ghcr.io`。CI 本身使用仓库的 `GITHUB_TOKEN`，不需要另配发布用 PAT。
+
+编辑 `docker/data/config.json`，填写公司、账号、服务器地址和 SOCKS5 密码。示例使用
+新版设备 SSO；`platform` 应改为服务器支持的登录方式。如果使用原有登录流程，删除
+`login_flow` 并按下文配置 `platform`、`password` 等字段。已有可用配置也可以复制到此处，
+同时复制相同 `interface_name` 的 Cookie 文件；设备信任所需的 `device_id`、`device_name`
+应保持一致。容器配置必须保留：
+
+```json
+{
+  "auto_setup_routes": false,
+  "use_vpn_dns": false,
+  "socks5_listen": "0.0.0.0:1080"
+}
+```
+
+整个 `docker/data` 目录需可写：程序会回写设备密钥、登录状态，并在同目录保存
+`corplink_cookies.json`。首次配置时，把运行用户的 UID/GID 写入仓库根目录 `.env`，
+让容器使用与此目录相同的文件权限（如果已有 `.env`，只更新这两项）：
+
+```sh
+printf 'CORPLINK_UID=%s\nCORPLINK_GID=%s\n' "$(id -u)" "$(id -g)" > .env
+```
+
+建议用普通用户执行上述准备操作；也可以使用镜像默认的 `10001:10001`，并将
+`docker/data` 的所有权赋给该 UID/GID。配置和 Cookie 不要只保存在容器可写层中。
+
+### 首次登录和后台运行
+
+```sh
+docker compose up -d
+docker compose logs --tail=100 corplink
+docker compose attach corplink
+```
+
+在自己的电脑浏览器中打开终端显示的 SSO 地址，将完整回调地址粘贴回此终端，
+按提示输入 MFA 验证码。服务器没有浏览器时出现“未能自动打开浏览器”是正常的。
+连接成功后依次按 **Ctrl-P、Ctrl-Q** 脱离终端，容器继续运行。
+`Ctrl-C` 会停止程序；不要同时启动两个使用同一配置目录的实例。
+
+```sh
+docker compose logs --tail=100 -f
+docker compose stop
+# 重新启动；若登录会话已过期，attach 后按提示完成认证
+docker compose up -d
+docker compose attach corplink
+```
+
+容器配置了自动重启和 30 秒正常退出时间。自动重启不替代 SSO/MFA；会话失效后仍需
+人工登录。`tunnel_recovery` 默认不开启，需要时按下文填入自己的内网探测地址。
+
+### 使用代理
+
+默认只发布服务器的 `127.0.0.1:1080`，示例发布的是 TCP 代理端口：
+
+```sh
+curl --socks5-hostname 127.0.0.1:1080 --proxy-user 'proxy-user:你的密码' \
+  https://你的内网域名/
+```
+
+`--socks5-hostname` 把域名解析交给 VPN 内的 DNS。客户端目标需要在 VPN 下发的路由
+或配置的额外路由范围内。SOCKS5 UDP ASSOCIATE 使用动态 UDP 端口，此端口映射没有
+提供 UDP 转发，不能通过再发布一个 `1080/udp` 来替代。
+
+在自己的电脑使用服务器代理，可以建立 SSH 转发：
+
+```sh
+ssh -N -L 1080:127.0.0.1:1080 user@server
+```
+
+随后连接电脑上的 `127.0.0.1:1080`。需要局域网直接访问时，在 `.env` 中设置
+`CORPLINK_BIND_ADDRESS=服务器的局域网IP`，可用 `CORPLINK_SOCKS_PORT` 修改宿主机端口，
+再执行 `docker compose up -d`。直接开放代理时应设置 SOCKS5 账号密码并限制来源地址。
+同一 Compose 网络内的其他容器可使用 `socks5h://corplink:1080` 并配置相同的代理账号密码，
+无需接管系统路由。
+
+### CI 发布规则
+
+`.github/workflows/docker.yml` 使用原生 x86_64 和 ARM64 runner，分别运行 Linux
+回归测试、非 root 容器检查及配置持久化检查。两个架构均通过后才合并并更新发布标签。
+PR 只构建测试；推送 `dev` 或正式版本 tag 时发布到 GHCR。
+
+| 触发条件 | 镜像标签 |
+|---|---|
+| 推送 `dev` | `dev`、`sha-完整commit` |
+| 推送 `bytedance-6.6.0` 等正式版本 tag | `6.6.0`、`bytedance-6.6.0`、`latest`、`sha-完整commit` |
+
+`latest` 只跟随正式版本 tag，`dev` 跟随开发分支。发布权限仅使用 `packages: write`；
+镜像自动关联当前 GitHub 仓库。参考 [GHCR 权限与可见性说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。
+
+### 更新和本地构建
+
+服务器更新时执行：
+
+```sh
+docker compose pull
+docker compose up -d --no-build
+```
+
+保留 `docker/data`，新容器会继续使用已有配置和会话。回滚时将 `.env` 中的
+`CORPLINK_IMAGE` 改为之前的版本号或 SHA 标签，再执行上述命令。
+
+需要自己构建时使用附加的 `compose.build.yaml`，在 Linux 内重编当前子模块和 Rust
+程序；配置了 `CORPLINK_IMAGE` 时先将其改为 `corplink-rs-dev:local`：
+
+```sh
+git submodule update --init --recursive
+docker compose -f compose.yaml -f compose.build.yaml build
+docker compose -f compose.yaml -f compose.build.yaml up -d --no-build
+```
+
+在服务器本机构建会自动使用服务器架构。也可以在 Apple Silicon 上为 x86_64 服务器
+构建并导出镜像（需要 Docker Buildx 和跨架构执行支持）：
+
+```sh
+docker buildx build --platform linux/amd64 --load -t corplink-rs-dev:local .
+docker save corplink-rs-dev:local | gzip > corplink-rs-dev-amd64.tar.gz
+# 复制到服务器后：
+docker load < corplink-rs-dev-amd64.tar.gz
+CORPLINK_IMAGE=corplink-rs-dev:local docker compose up -d --no-build
+```
+
+ARM64 服务器将平台替换为 `linux/arm64`。可通过 `docker build --target test .` 在
+Linux 构建环境内运行 Rust 回归测试。Compose 的交互终端和端口配置见
+[Docker Compose 服务说明](https://docs.docker.com/reference/compose-file/services/)。
+
 ## 手动编译
 
 ### linux/macos

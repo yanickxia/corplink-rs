@@ -1,0 +1,199 @@
+name: Docker / GHCR
+
+on:
+  push:
+    branches: [dev]
+    tags: ["bytedance-[0-9]*.[0-9]*.[0-9]*"]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      publish: ${{ steps.image.outputs.publish }}
+      labels: ${{ steps.meta.outputs.labels }}
+      json: ${{ steps.meta.outputs.json }}
+    steps:
+      - name: Image name and publication policy
+        id: image
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}-dev" >> "$GITHUB_OUTPUT"
+          publish=false
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            if [[ "$GITHUB_REF" == refs/heads/dev || "$GITHUB_REF" =~ ^refs/tags/bytedance-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              publish=true
+            fi
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=ref,event=tag
+            type=match,pattern=bytedance-(\d+\.\d+\.\d+),group=1
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/bytedance-') }}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=corplink-rs-dev
+            org.opencontainers.image.description=CorpLink VPN client with userspace SOCKS5
+
+  build:
+    needs: metadata
+    name: Build and test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout with pinned WireGuard submodule
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Linux regression tests
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: test
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+
+      - name: Build runtime image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: corplink-rs-dev:ci
+          labels: ${{ needs.metadata.outputs.labels }}
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
+
+      - name: Verify non-root runtime and persistent configuration
+        run: python3 scripts/test-docker-image.py corplink-rs-dev:ci
+
+      - name: Log in to GHCR
+        if: needs.metadata.outputs.publish == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push tested platform by digest
+        if: needs.metadata.outputs.publish == 'true'
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ needs.metadata.outputs.labels }}
+          outputs: type=image,name=${{ needs.metadata.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export platform digest
+        if: needs.metadata.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload platform digest
+        if: needs.metadata.outputs.publish == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish multi-platform tags
+    needs: [metadata, build]
+    if: needs.metadata.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge and verify manifests
+        env:
+          IMAGE_NAME: ${{ needs.metadata.outputs.image }}
+          METADATA_JSON: ${{ needs.metadata.outputs.json }}
+        run: |
+          set -euo pipefail
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA_JSON")
+          (( ${#tags[@]} > 0 ))
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(--tag "$tag")
+          done
+          shopt -s nullglob
+          files=("$RUNNER_TEMP"/digests/*)
+          (( ${#files[@]} == 2 ))
+          sources=()
+          for file in "${files[@]}"; do
+            digest="${file##*/}"
+            [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
+            sources+=("$IMAGE_NAME@sha256:$digest")
+          done
+          docker buildx imagetools create "${tag_args[@]}" \
+            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --annotation "index:org.opencontainers.image.description=CorpLink VPN client with userspace SOCKS5" \
+            "${sources[@]}"
+          docker buildx imagetools inspect "${tags[0]}" --raw > "$RUNNER_TEMP/manifest.json"
+          jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]' \
+            "$RUNNER_TEMP/manifest.json"
+          printf 'Published amd64 + arm64 images:\n\n' >> "$GITHUB_STEP_SUMMARY"
+          printf -- '- `%s`\n' "${tags[@]}" >> "$GITHUB_STEP_SUMMARY"

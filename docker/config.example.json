@@ -1,0 +1,16 @@
+{
+  "company_name": "your-company",
+  "username": "your-account",
+  "server": "https://corplink.example.com",
+  "login_flow": "device",
+  "platform": "bytedance_sso",
+  "device_name": "corplink-server",
+  "interface_name": "corplink",
+  "auto_setup_routes": false,
+  "use_vpn_dns": false,
+  "route_mode": "split",
+  "socks5_listen": "0.0.0.0:1080",
+  "socks5_username": "proxy-user",
+  "socks5_password": "change-this-proxy-password",
+  "state": "Init"
+}
