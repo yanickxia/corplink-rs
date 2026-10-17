@@ -6,7 +6,6 @@ mod device_login;
 mod qrcode;
 mod recovery;
 mod resp;
-mod sign;
 mod state;
 mod template;
 mod totp;

@@ -28,7 +28,6 @@ use crate::config::{
 use crate::qrcode::TerminalQrCode;
 use crate::device_login::{self, DeviceAuthorization};
 use crate::resp::*;
-use crate::sign;
 use crate::state::State;
 use crate::totp::{totp_offset, TIME_STEP};
 use crate::utils;
@@ -36,14 +35,11 @@ use crate::utils;
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
 const TPS_AUTH_TIMEOUT: Duration = Duration::from_secs(180);
 const TPS_AUTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const SIGN_ROOT_KEY_VERSION: u64 = 1;
+const SIGN_SECRET: &[u8] = b"TOK@@AoNfRIX+3bla%";
+const SIGN_HASH_BLOCK_SIZE: usize = 64;
+const SIGN_HASH_OUTPUT_SIZE: usize = 32;
 const SIGN_RETRY_CODES: [i32; 2] = [11020001, 11020002];
-
-fn cookie_value<'a>(cookie_header: &'a str, expected_name: &str) -> Option<&'a str> {
-    cookie_header
-        .split(';')
-        .filter_map(|part| part.trim().split_once('='))
-        .find_map(|(name, value)| (name == expected_name).then_some(value))
-}
 
 fn merge_additional_routes(
     mut routes: Vec<String>,
@@ -125,6 +121,88 @@ async fn resolve_additional_domains(
         }
     }
     routes
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; SIGN_HASH_OUTPUT_SIZE] {
+    let mut key_block = [0u8; SIGN_HASH_BLOCK_SIZE];
+    if key.len() > SIGN_HASH_BLOCK_SIZE {
+        key_block[..SIGN_HASH_OUTPUT_SIZE].copy_from_slice(&sha2::Sha256::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; SIGN_HASH_BLOCK_SIZE];
+    let mut opad = [0x5cu8; SIGN_HASH_BLOCK_SIZE];
+    for i in 0..SIGN_HASH_BLOCK_SIZE {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+
+    let mut inner = sha2::Sha256::new();
+    inner.update(ipad);
+    inner.update(data);
+    let inner = inner.finalize();
+
+    let mut outer = sha2::Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+    let zero_salt = [0u8; SIGN_HASH_OUTPUT_SIZE];
+    let prk = if salt.is_empty() {
+        hmac_sha256(&zero_salt, secret)
+    } else {
+        hmac_sha256(salt, secret)
+    };
+
+    let mut okm = Vec::with_capacity(len);
+    let mut previous = Vec::new();
+    let mut counter = 1u8;
+    while okm.len() < len {
+        let mut input = Vec::with_capacity(previous.len() + info.len() + 1);
+        input.extend_from_slice(&previous);
+        input.extend_from_slice(info);
+        input.push(counter);
+        previous = hmac_sha256(&prk, &input).to_vec();
+        okm.extend_from_slice(&previous);
+        counter = counter.wrapping_add(1);
+    }
+    okm.truncate(len);
+    okm
+}
+
+fn write_pb_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn write_pb_field_varint(field: u64, value: u64, out: &mut Vec<u8>) {
+    write_pb_varint(field << 3, out);
+    write_pb_varint(value, out);
+}
+
+fn write_pb_field_bytes(field: u64, value: &[u8], out: &mut Vec<u8>) {
+    write_pb_varint((field << 3) | 2, out);
+    write_pb_varint(value.len() as u64, out);
+    out.extend_from_slice(value);
+}
+
+fn encode_sign_header(signing_input_params: u64, signing_result: &[u8]) -> String {
+    let mut body = Vec::with_capacity(40);
+    write_pb_field_varint(1, SIGN_ROOT_KEY_VERSION, &mut body);
+    write_pb_field_varint(3, signing_input_params, &mut body);
+    write_pb_field_bytes(4, signing_result, &mut body);
+
+    use base64::Engine;
+    format!(
+        "v1;{}",
+        base64::engine::general_purpose::STANDARD.encode(body)
+    )
 }
 
 fn corplink_client_builder() -> ClientBuilder {
@@ -312,6 +390,115 @@ impl Client {
         Ok(())
     }
 
+    fn cookie_header_for_url(&self, url: &Url) -> Result<Option<header::HeaderValue>> {
+        Ok(ReqwestCookieStore::cookies(self.cookie.as_ref(), url))
+    }
+
+    fn csrf_token_for_url(&self, url: &Url) -> Result<Option<header::HeaderValue>> {
+        self.cookie_value_for_url(url, "csrf-token")
+            .and_then(|value| {
+                value
+                    .map(|value| {
+                        header::HeaderValue::from_str(&value)
+                            .context("invalid csrf-token header value")
+                    })
+                    .transpose()
+            })
+    }
+
+    fn cookie_value_for_url(&self, url: &Url, name: &str) -> Result<Option<String>> {
+        let cookie_store = self
+            .cookie
+            .lock()
+            .map_err(|e| anyhow!("failed to lock cookie store: {e}"))?;
+        let Some(domain) = url.domain().or_else(|| url.host_str()) else {
+            return Ok(None);
+        };
+        Ok(cookie_store
+            .get(domain, "/", name)
+            .map(|cookie| cookie.value().to_string()))
+    }
+
+    fn signing_input_params(api: &ApiName) -> Option<u64> {
+        match api {
+            ApiName::ListVPN => Some(510),
+            ApiName::ConnectVPN => Some(542),
+            _ => None,
+        }
+    }
+
+    fn sign_request(
+        &self,
+        api: &ApiName,
+        method: &str,
+        url: &Url,
+        body: Option<&str>,
+        cookie_header: Option<&header::HeaderValue>,
+        csrf_token: Option<&header::HeaderValue>,
+        jwt_token: Option<&header::HeaderValue>,
+    ) -> Result<Option<String>> {
+        let Some(signing_input_params) = Self::signing_input_params(api) else {
+            return Ok(None);
+        };
+        let device_id = self
+            .conf
+            .device_id
+            .as_deref()
+            .context("device_id missing in config; required for request signing")?;
+        let info = format!("{}|{}", self.conf.company_name, device_id);
+        let key = hkdf_sha256(SIGN_SECRET, &[], info.as_bytes(), SIGN_HASH_OUTPUT_SIZE);
+
+        let cookie = cookie_header
+            .map(header::HeaderValue::as_bytes)
+            .unwrap_or_default();
+        let csrf = csrf_token
+            .map(|value| {
+                value
+                    .to_str()
+                    .context("invalid csrf-token header for signing")
+            })
+            .transpose()?
+            .unwrap_or("");
+        let body_hash = body
+            .filter(|body| !body.is_empty())
+            .map(|body| sha2::Sha256::digest(body.as_bytes()).to_vec())
+            .unwrap_or_default();
+        let vpn_token = if matches!(api, ApiName::ConnectVPN) {
+            jwt_token
+                .context("jwt-token header missing; required for connect request signing")?
+                .to_str()
+                .context("invalid jwt-token header for signing")?
+        } else {
+            ""
+        };
+
+        let fields: [&[u8]; 10] = [
+            b"",
+            method.as_bytes(),
+            url.path().as_bytes(),
+            url.query().unwrap_or("").as_bytes(),
+            body_hash.as_slice(),
+            cookie,
+            b"",
+            csrf.as_bytes(),
+            b"",
+            vpn_token.as_bytes(),
+        ];
+
+        let mut canonical = Vec::new();
+        for (index, value) in fields.iter().enumerate().skip(1) {
+            if (signing_input_params & (1 << index)) != 0 {
+                canonical.extend_from_slice(value);
+            }
+        }
+
+        let signing_result = hmac_sha256(&key, &canonical);
+        Ok(Some(encode_sign_header(
+            signing_input_params,
+            &signing_result,
+        )))
+    }
+
     async fn request<T: DeserializeOwned + fmt::Debug>(
         &mut self,
         api: ApiName,
@@ -328,8 +515,7 @@ impl Client {
     ) -> Result<Resp<T>> {
         let device_auth = self.conf.login_flow == Some(LoginFlow::Device)
             && api.supports_device_login();
-        // body 不随重试变化：只序列化一次；body_bytes 借用 body_string，
-        // 在整个函数生命周期内保持不变，循环内直接复用。
+        // Serialize once so signing and every retry send the same body bytes.
         let body_string: Option<String> = match &body {
             Some(b) => Some(
                 serde_json::to_string(b)
@@ -337,7 +523,6 @@ impl Client {
             ),
             None => None,
         };
-        let body_bytes: &[u8] = body_string.as_deref().map(|s| s.as_bytes()).unwrap_or(b"");
         let method = if body_string.is_some() { "POST" } else { "GET" };
 
         for attempt in 0..2 {
@@ -355,7 +540,7 @@ impl Client {
             // The community Linux client timestamps only the signed list/connect
             // requests. Ping and disconnect report keep their minimal Android-v2
             // query shape and are deliberately unsigned.
-            let is_signed = sign::sign_mask_by_path(url.path()).is_some();
+            let is_signed = Self::signing_input_params(&api).is_some();
             if is_signed {
                 let ts = self.current_timestamp().to_string();
                 // 用 query_pairs_mut 追加，保持既有参数在前、timestamp 在后；
@@ -363,21 +548,26 @@ impl Client {
                 url.query_pairs_mut().append_pair("timestamp", &ts);
             }
 
-            // 同一轮内冻结 Cookie/CSRF：签名值与实际请求头必须使用同一份 token。
-            let cookie_str = self.cookie_header_for(&url)?;
-            let csrf = cookie_value(&cookie_str, "csrf-token")
-                .unwrap_or("")
-                .to_owned();
-            let signing_jwt = (url.path() == "/vpn/conn")
-                .then(|| cookie_value(&cookie_str, "vpn-token").map(str::to_owned))
-                .flatten();
-            let sign_header = self.build_sign_header_with_cookie(
+            let cookie_header = self.cookie_header_for_url(&url)?;
+            let csrf_token = self.csrf_token_for_url(&url)?;
+            // The official connect request sends signing field 9 as jwt-token. Read once so the
+            // signed token and the transmitted header cannot diverge.
+            let jwt_token = if matches!(api, ApiName::ConnectVPN) {
+                let token = self
+                    .cookie_value_for_url(&url, "vpn-token")?
+                    .context("vpn-token cookie missing; required for connect request signing")?;
+                Some(header::HeaderValue::from_str(&token).context("invalid jwt-token header value")?)
+            } else {
+                None
+            };
+            let sign_header = self.sign_request(
+                &api,
                 method,
                 &url,
-                body_bytes,
-                &cookie_str,
-                &csrf,
-                signing_jwt.as_deref().unwrap_or(""),
+                body_string.as_deref(),
+                cookie_header.as_ref(),
+                csrf_token.as_ref(),
+                jwt_token.as_ref(),
             )?;
 
             let mut rb = match &body_string {
@@ -393,21 +583,17 @@ impl Client {
                     .header(header::ACCEPT_LANGUAGE, "en");
             }
 
-            if !csrf.is_empty() {
-                rb = rb.header("csrf-token", &csrf);
+            if let Some(cookie_header) = cookie_header {
+                rb = rb.header(header::COOKIE, cookie_header);
             }
-            if !cookie_str.is_empty() {
-                rb = rb.header(header::COOKIE, &cookie_str);
+            if let Some(csrf_token) = csrf_token {
+                rb = rb.header("csrf-token", csrf_token);
             }
-            // The VPN endpoint reads the bit9 signing input from jwt-token.
-            // Freeze it with the Cookie snapshot used to compute Sign so token
-            // rotation cannot make the signature and transmitted header diverge.
-            if let Some(jwt) = signing_jwt.as_deref() {
-                rb = rb.header("jwt-token", jwt);
+            if let Some(jwt_token) = jwt_token {
+                rb = rb.header("jwt-token", jwt_token);
             }
-            if let Some((name, value)) = sign_header {
-                log::debug!("signing {api:?} path={}", url.path());
-                rb = rb.header(name, value);
+            if let Some(sign_header) = sign_header {
+                rb = rb.header("sign", sign_header);
             }
 
             let resp = rb
@@ -1191,76 +1377,6 @@ impl Client {
         Utc::now().timestamp() + self.date_offset_sec as i64
     }
 
-    /// 按 cookie jar 顺序拼 "name=value"，用 "; " 连接（供签名的 cookieStr 用）。
-    /// 顺序须与 reqwest 实际发送的 Cookie 头一致——两者都源自同一 jar。
-    fn cookie_header_for(&self, url: &Url) -> Result<String> {
-        let store = self
-            .cookie
-            .lock()
-            .map_err(|e| anyhow!("failed to lock cookie store: {e}"))?;
-        let pairs: Vec<String> = store
-            .get_request_values(url)
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect();
-        Ok(pairs.join("; "))
-    }
-
-    /// 若该 path 需要签名，返回 (header_name, header_value)。
-    #[cfg(test)]
-    fn build_sign_header(
-        &self,
-        method: &str,
-        url: &Url,
-        body: &[u8],
-    ) -> Result<Option<(String, String)>> {
-        let cookie_str = self.cookie_header_for(url)?;
-        let csrf = cookie_value(&cookie_str, "csrf-token").unwrap_or("");
-        let jwt = cookie_value(&cookie_str, "vpn-token").unwrap_or("");
-
-        self.build_sign_header_with_cookie(method, url, body, &cookie_str, csrf, jwt)
-    }
-
-    fn build_sign_header_with_cookie(
-        &self,
-        method: &str,
-        url: &Url,
-        body: &[u8],
-        cookie_str: &str,
-        csrf: &str,
-        jwt: &str,
-    ) -> Result<Option<(String, String)>> {
-        let path = url.path();
-        let mask = match sign::sign_mask_by_path(path) {
-            Some(m) => m,
-            None => return Ok(None),
-        };
-        let company = &self.conf.company_name;
-        let device_id = self
-            .conf
-            .device_id
-            .as_deref()
-            .context("device_id required for request signing")?;
-        if csrf.is_empty() && (mask >> 7) & 1 == 1 {
-            log::warn!(
-                "no csrf-token cookie for signed endpoint {} (mask {:#x}); signing with empty csrf, signature may be rejected",
-                url.path(),
-                mask
-            );
-        }
-        if jwt.is_empty() && (mask >> 9) & 1 == 1 {
-            log::warn!(
-                "no vpn-token cookie for signed endpoint {} (mask {:#x}); signing with empty jwt, signature may be rejected",
-                url.path(),
-                mask
-            );
-        }
-        let query = url.query().unwrap_or("");
-        let value = sign::compute_sign(
-            company, device_id, method, path, query, body, cookie_str, csrf, jwt, mask,
-        );
-        Ok(Some((sign::SIGN_HEADER.to_string(), value)))
-    }
-
     fn vpn_endpoint_url(&self, host: &str, api_port: u16) -> Result<Url> {
         let server_url = self
             .conf
@@ -1780,7 +1896,7 @@ mod tests {
 
     use cookie::Cookie as RawCookie;
     use cookie_store::CookieStore;
-    use reqwest::{ClientBuilder, Url};
+    use reqwest::{header::HeaderValue, ClientBuilder, Url};
     use reqwest_cookie_store::CookieStoreMutex;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1789,14 +1905,112 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        cookie_value, corplink_client_builder, merge_additional_routes, resolve_additional_domains,
-        vpn_connect_body, Client, ReqwestCookieStore,
+        corplink_client_builder, encode_sign_header, hkdf_sha256, merge_additional_routes,
+        resolve_additional_domains, vpn_connect_body, Client, ReqwestCookieStore,
     };
     use crate::api::{ApiName, ApiUrl};
     use crate::config::{Config, WgConf};
     use crate::resp::RespVpnInfo;
-    use crate::sign;
     use crate::utils::apply_route_filters;
+
+    fn cookie_value<'a>(cookie_header: &'a str, expected_name: &str) -> Option<&'a str> {
+        cookie_header
+            .split(';')
+            .filter_map(|part| part.trim().split_once('='))
+            .find_map(|(name, value)| (name == expected_name).then_some(value))
+    }
+
+    #[test]
+    fn hkdf_sha256_matches_rfc5869_case_1() {
+        let ikm = vec![0x0b; 22];
+        let salt = hex::decode("000102030405060708090a0b0c").unwrap();
+        let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let okm = hkdf_sha256(&ikm, &salt, &info, 42);
+        assert_eq!(
+            hex::encode(okm),
+            "3cb25f25faacd57a90434f64d0362f2a\
+             2d2d0a90cf1a5a4c5db02d56ecc4c5bf\
+             34007208d5b887185865"
+                .replace(char::is_whitespace, "")
+        );
+    }
+
+    #[test]
+    fn sign_header_uses_observed_wire_shape() {
+        let header = encode_sign_header(510, &[0x11; 32]);
+        assert!(header.starts_with("v1;"));
+        let encoded = header.trim_start_matches("v1;");
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(
+            hex::encode(bytes),
+            format!("080118fe032220{}", "11".repeat(32))
+        );
+    }
+
+    #[test]
+    fn signing_preserves_unicode_cookie_bytes() {
+        let client = test_client();
+        let url = reqwest::Url::parse("https://vpn.example.test/api/vpn/list?timestamp=123").unwrap();
+        let cookie = reqwest::header::HeaderValue::from_bytes("device_name=测试".as_bytes()).unwrap();
+        assert!(cookie.to_str().is_err());
+        let sign = client
+            .sign_request(
+                &crate::api::ApiName::ListVPN,
+                "GET",
+                &url,
+                None,
+                Some(&cookie),
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        // Synthetic fixture generated independently with Python hashlib/hmac.
+        assert_eq!(
+            sign,
+            "v1;CAEY/gMiIF1jPsy+5XZFVpEbSlT4/ZuHdSf0axAxYSyOZcVtuQrI"
+        );
+    }
+
+    #[test]
+    fn connect_signature_matches_synthetic_fixture_and_requires_jwt_token() {
+        let client = test_client();
+        let url =
+            reqwest::Url::parse("https://node.example.test/vpn/conn?app_version=3.3.17&timestamp=123")
+                .unwrap();
+        let token = reqwest::header::HeaderValue::from_static("synthetic.jwt.token");
+        let body = r#"{"public_key":"synthetic","otp":""}"#;
+        let sign = client
+            .sign_request(
+                &crate::api::ApiName::ConnectVPN,
+                "POST",
+                &url,
+                Some(body),
+                None,
+                None,
+                Some(&token),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sign,
+            "v1;CAEYngQiIDiahoyaFjeRwMOTsnY/0g9Eq2Ku/nsOL5P9t3G1ZolJ"
+        );
+        assert!(client
+            .sign_request(
+                &crate::api::ApiName::ConnectVPN,
+                "POST",
+                &url,
+                Some(body),
+                None,
+                None,
+                None,
+            )
+            .is_err());
+    }
 
     async fn start_probe_server(
         barrier: Arc<Barrier>,
@@ -1880,6 +2094,11 @@ mod tests {
         (port, request_rx, task)
     }
 
+    fn cookie_header(client: &Client, url: &Url) -> String {
+        let header = client.cookie_header_for_url(url).unwrap().unwrap();
+        String::from_utf8(header.as_bytes().to_vec()).unwrap()
+    }
+
     fn request_header<'a>(request: &'a str, expected_name: &str) -> Option<&'a str> {
         request.lines().skip(1).find_map(|line| {
             let (name, value) = line.split_once(':')?;
@@ -1897,21 +2116,33 @@ mod tests {
         let cookie = request_header(request, "cookie").unwrap_or("");
         let csrf = request_header(request, "csrf-token").unwrap_or("");
         let jwt = request_header(request, "jwt-token").unwrap_or("");
-        let body = request.split_once("\r\n\r\n").unwrap().1.as_bytes();
-        let actual = request_header(request, sign::SIGN_HEADER).expect("missing Sign header");
-        let mask = sign::sign_mask_by_path(url.path()).expect("path should be signed");
-        let expected = sign::compute_sign(
-            company,
-            device_id,
-            method,
-            url.path(),
-            url.query().unwrap_or(""),
-            body,
-            cookie,
-            csrf,
-            jwt,
-            mask,
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let actual = request_header(request, "sign").expect("missing Sign header");
+        let key = hkdf_sha256(
+            super::SIGN_SECRET,
+            &[],
+            format!("{company}|{device_id}").as_bytes(),
+            32,
         );
+        let mut canonical =
+            format!("{method}{}{}", url.path(), url.query().unwrap_or("")).into_bytes();
+        if !body.is_empty() {
+            use sha2::Digest;
+            canonical.extend_from_slice(&sha2::Sha256::digest(body.as_bytes()));
+        }
+        let mask = match url.path() {
+            "/api/vpn/list" => {
+                canonical.extend_from_slice(cookie.as_bytes());
+                canonical.extend_from_slice(csrf.as_bytes());
+                510
+            }
+            "/vpn/conn" => {
+                canonical.extend_from_slice(jwt.as_bytes());
+                542
+            }
+            path => panic!("unexpected signed path: {path}"),
+        };
+        let expected = encode_sign_header(mask, &super::hmac_sha256(&key, &canonical));
         assert_eq!(actual, expected);
 
         url.query_pairs()
@@ -1919,7 +2150,9 @@ mod tests {
             .expect("missing timestamp")
     }
 
-    async fn start_sign_retry_server() -> (
+    async fn start_sign_retry_server(
+        error_code: i32,
+    ) -> (
         u16,
         oneshot::Receiver<Vec<String>>,
         tokio::task::JoinHandle<()>,
@@ -1934,9 +2167,10 @@ mod tests {
                 requests.push(read_request(&mut stream).await);
 
                 let body = if attempt == 0 {
-                    r#"{"code":11020001,"message":"expired","data":{"unexpected":true}}"#
+                    json!({"code": error_code, "message": "expired", "data": {"unexpected": true}})
+                        .to_string()
                 } else {
-                    r#"{"code":0,"data":[]}"#
+                    r#"{"code":0,"data":[]}"#.to_string()
                 };
                 let server_time = if attempt == 0 {
                     SystemTime::now() + Duration::from_secs(120)
@@ -1944,7 +2178,7 @@ mod tests {
                     SystemTime::now()
                 };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nDate: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\nDate: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nSet-Cookie: csrf-token=rotated-csrf; Path=/\r\nSet-Cookie: vpn-token=token-b; Path=/\r\nConnection: close\r\n\r\n{body}",
                     httpdate::fmt_http_date(server_time),
                     body.len()
                 );
@@ -1953,6 +2187,114 @@ mod tests {
             requests_tx.send(requests).unwrap();
         });
         (port, requests_rx, task)
+    }
+
+    fn test_client_for_server(port: u16) -> Client {
+        let mut client = test_client();
+        client.conf.server = Some(format!("http://127.0.0.1:{port}"));
+        client.api_url = ApiUrl::new(&client.conf).unwrap();
+        client
+    }
+
+    #[tokio::test]
+    async fn connect_sends_the_signed_token_as_jwt_header_only_on_connect() {
+        use sha2::Digest;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let capture = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0, "request closed before its body arrived");
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                        let body_len: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + body_len {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                let body = r#"{"code":0,"data":{}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let mut client = test_client_for_server(port);
+        client.prepare_vpn_endpoint("127.0.0.1", port).unwrap();
+        let endpoint = client.vpn_endpoint_url("127.0.0.1", port).unwrap();
+        let token = "synthetic.case-Sensitive.token";
+        client
+            .cookie
+            .lock()
+            .unwrap()
+            .insert_raw(&cookie::Cookie::new("vpn-token", token), &endpoint)
+            .unwrap();
+        let mut body = serde_json::Map::new();
+        body.insert("public_key".into(), json!("synthetic-public-key"));
+        body.insert("otp".into(), json!(""));
+        timeout(Duration::from_secs(5), async {
+            client
+                .request::<serde_json::Value>(crate::api::ApiName::ConnectVPN, Some(body))
+                .await
+                .unwrap();
+            client
+                .request::<serde_json::Value>(crate::api::ApiName::ListVPN, None)
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        let requests = capture.await.unwrap();
+        let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        let header = |name: &str| {
+            headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name).then(|| value.trim())
+                })
+                .unwrap()
+        };
+        assert_eq!(header("jwt-token"), token);
+        assert!(header("cookie")
+            .split("; ")
+            .any(|cookie| cookie == format!("vpn-token={token}")));
+        let target = headers
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        assert!(target.starts_with("/vpn/conn?"));
+        let key = hkdf_sha256(super::SIGN_SECRET, &[], b"test|test-device", 32);
+        let (path, query) = target.split_once('?').unwrap();
+        let mut canonical = format!("POST{path}{query}").into_bytes();
+        canonical.extend_from_slice(&sha2::Sha256::digest(body.as_bytes()));
+        canonical.extend_from_slice(header("jwt-token").as_bytes());
+        assert_eq!(
+            header("sign"),
+            encode_sign_header(542, &super::hmac_sha256(&key, &canonical))
+        );
+        assert!(!requests[1].to_ascii_lowercase().contains("\r\njwt-token:"));
+        assert!(requests[1].starts_with("GET /api/vpn/list?"));
     }
 
     fn vpn_info(port: u16, name: &str) -> RespVpnInfo {
@@ -2146,9 +2488,7 @@ mod tests {
             .get_api_url(&ApiName::ListVPN)
             .contains("os=Linux"));
         let restored = Client::new(client.conf.clone()).unwrap();
-        assert!(restored
-            .cookie_header_for(&Url::parse(client.conf.server.as_ref().unwrap()).unwrap())
-            .unwrap()
+        assert!(cookie_header(&restored, &Url::parse(client.conf.server.as_ref().unwrap()).unwrap())
             .contains("session=fresh-session"));
         server.await.unwrap();
         let config_path = std::path::Path::new(client.conf.conf_file.as_ref().unwrap());
@@ -2314,12 +2654,12 @@ mod tests {
         let second_request = second_request.await.unwrap().to_ascii_lowercase();
         assert_eq!(
             request_header(&first_request, "cookie")
-                .and_then(|value| super::cookie_value(value, "device_id")),
+                .and_then(|value| cookie_value(value, "device_id")),
             Some("test-device")
         );
         assert_eq!(
             request_header(&second_request, "cookie")
-                .and_then(|value| super::cookie_value(value, "device_id")),
+                .and_then(|value| cookie_value(value, "device_id")),
             Some("test-device")
         );
         assert!(first_request.contains("user-agent: corplink/3.3.17 "));
@@ -2394,7 +2734,7 @@ mod tests {
 
     #[tokio::test]
     async fn signed_request_retries_with_current_csrf_and_refreshed_timestamp() {
-        let (port, requests_rx, server_task) = start_sign_retry_server().await;
+        let (port, requests_rx, server_task) = start_sign_retry_server(11020001).await;
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2430,13 +2770,75 @@ mod tests {
 
         let requests = requests_rx.await.unwrap();
         assert_eq!(requests.len(), 2);
-        for request in &requests {
-            assert_eq!(request_header(request, "csrf-token"), Some("fresh-csrf"));
-        }
+        assert_eq!(
+            request_header(&requests[0], "csrf-token"),
+            Some("fresh-csrf")
+        );
+        assert_eq!(
+            request_header(&requests[1], "csrf-token"),
+            Some("rotated-csrf")
+        );
+        assert_eq!(
+            request_header(&requests[1], "cookie")
+                .and_then(|value| cookie_value(value, "csrf-token")),
+            Some("rotated-csrf")
+        );
         let first_timestamp = assert_valid_wire_signature(&requests[0], "test", "test-device");
         let second_timestamp = assert_valid_wire_signature(&requests[1], "test", "test-device");
         assert!(second_timestamp - first_timestamp >= 100);
         server_task.await.unwrap();
+        remove_test_cookie_file(&client);
+    }
+
+    fn remove_test_cookie_file(client: &Client) {
+        let directory = std::path::Path::new(client.conf.conf_file.as_ref().unwrap())
+            .parent()
+            .unwrap();
+        let file = directory.join(format!(
+            "{}_cookies.json",
+            client.conf.interface_name.as_ref().unwrap()
+        ));
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_retry_uses_rotated_jwt_and_refreshed_timestamp() {
+        let (port, requests_rx, server_task) = start_sign_retry_server(11020002).await;
+        let mut client = test_client_for_server(port);
+        let endpoint_url = client.prepare_vpn_endpoint("127.0.0.1", port).unwrap();
+        client
+            .cookie
+            .lock()
+            .unwrap()
+            .insert_raw(&RawCookie::new("vpn-token", "token-a"), &endpoint_url)
+            .unwrap();
+        let response = client
+            .request::<serde_json::Value>(
+                ApiName::ConnectVPN,
+                Some(vpn_connect_body("synthetic-public-key", "")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.code, 0);
+        let requests = requests_rx.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for (request, token) in requests.iter().zip(["token-a", "token-b"]) {
+            assert_eq!(request_header(request, "jwt-token"), Some(token));
+            assert_eq!(
+                request_header(request, "cookie")
+                    .and_then(|value| cookie_value(value, "vpn-token")),
+                Some(token)
+            );
+        }
+        let first_timestamp = assert_valid_wire_signature(&requests[0], "test", "test-device");
+        let second_timestamp = assert_valid_wire_signature(&requests[1], "test", "test-device");
+        assert!(second_timestamp - first_timestamp >= 100);
+        assert_eq!(
+            requests[0].split_once("\r\n\r\n").unwrap().1,
+            requests[1].split_once("\r\n\r\n").unwrap().1
+        );
+        server_task.await.unwrap();
+        remove_test_cookie_file(&client);
     }
 
     #[tokio::test]
@@ -2468,7 +2870,7 @@ mod tests {
         ));
         assert!(request_line.contains("&soc="));
         assert!(request_line.contains("&timestamp="));
-        assert!(request_header(&request, sign::SIGN_HEADER).is_some());
+        assert!(request_header(&request, "sign").is_some());
         assert_eq!(request_header(&request, "jwt-token"), Some("token-a"));
         assert_eq!(
             request_header(&request, "cookie").and_then(|value| cookie_value(value, "vpn-token")),
@@ -2520,7 +2922,7 @@ mod tests {
             request.lines().next().unwrap(),
             "POST /vpn/report?os=Android&os_version=2 HTTP/1.1"
         );
-        assert!(request_header(&request, sign::SIGN_HEADER).is_none());
+        assert!(request_header(&request, "sign").is_none());
         assert!(request_header(&request, "jwt-token").is_none());
         assert!(!request.contains("timestamp="));
         server_task.await.unwrap();
@@ -2545,8 +2947,8 @@ mod tests {
         assert_eq!(ipv6_endpoint.as_str(), "https://[2001:db8::1]:8443/");
 
         // prepare_vpn_endpoint 会把网关域会话 cookie 复制到数据面 IP host，故
-        // cookie_header_for(数据面 url) 应能取到 device_id 等 cookie。
-        let data_plane_cookie = client.cookie_header_for(&ipv6_endpoint).unwrap();
+        // The endpoint Cookie header must include the synchronized device ID.
+        let data_plane_cookie = cookie_header(&client, &ipv6_endpoint);
         assert!(data_plane_cookie.contains("device_id=test-device"));
     }
 
@@ -2583,17 +2985,17 @@ mod tests {
             .sync_gateway_cookies_to_endpoint(&endpoint_url)
             .unwrap();
 
-        let endpoint_cookie = client.cookie_header_for(&endpoint_url).unwrap();
+        let endpoint_cookie = cookie_header(&client, &endpoint_url);
         assert_eq!(
-            super::cookie_value(&endpoint_cookie, "session"),
+            cookie_value(&endpoint_cookie, "session"),
             Some("control-session")
         );
         assert_eq!(
-            super::cookie_value(&endpoint_cookie, "csrf-token"),
+            cookie_value(&endpoint_cookie, "csrf-token"),
             Some("control-csrf")
         );
         assert_eq!(
-            super::cookie_value(&endpoint_cookie, "vpn-token"),
+            cookie_value(&endpoint_cookie, "vpn-token"),
             Some("token-b")
         );
     }
@@ -2703,64 +3105,23 @@ mod tests {
     }
 
     #[test]
-    fn build_sign_header_skips_unsigned_path() {
-        let client = sign_test_client(sign_test_config(Some("dev-123")));
-        let url = Url::parse("https://example.com/api/other").unwrap();
-        let out = client
-            .build_sign_header("GET", &url, b"")
-            .expect("build_sign_header ok");
-        assert!(out.is_none(), "unsigned path must not produce a Sign header");
+    fn unsigned_requests_do_not_require_signing_credentials() {
+        let client = sign_test_client(sign_test_config(None));
+        for api in [ApiName::PingVPN, ApiName::DisconnectVPN] {
+            let url = Url::parse("https://example.com/vpn/ping").unwrap();
+            assert!(client
+                .sign_request(&api, "GET", &url, None, None, None, None)
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[test]
-    fn build_sign_header_signs_known_path() {
-        let client = sign_test_client(sign_test_config(Some("dev-123")));
-        let url = Url::parse("https://example.com/api/vpn/list").unwrap();
-        let (name, value) = client
-            .build_sign_header("GET", &url, b"")
-            .expect("build_sign_header ok")
-            .expect("signed path should produce a header");
-        assert_eq!(name, sign::SIGN_HEADER);
-        assert!(value.starts_with("v1;"), "unexpected sign value: {value}");
-    }
-
-    #[test]
-    fn connect_signature_uses_current_vpn_cookie() {
-        let client = sign_test_client(sign_test_config(Some("dev-123")));
-        let url = Url::parse("https://example.com/vpn/conn?timestamp=1700000000").unwrap();
-        client
-            .cookie
-            .lock()
-            .unwrap()
-            .insert_raw(&RawCookie::new("vpn-token", "token-a"), &url)
-            .unwrap();
-        let body = br#"{"public_key":"key","otp":""}"#;
-        let (_, actual) = client
-            .build_sign_header("POST", &url, body)
-            .unwrap()
-            .expect("connect must be signed");
-        let expected = sign::compute_sign(
-            "TestCo",
-            "dev-123",
-            "POST",
-            "/vpn/conn",
-            "timestamp=1700000000",
-            body,
-            "",
-            "",
-            "token-a",
-            0x21e,
-        );
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn build_sign_header_requires_device_id() {
+    fn signed_request_requires_device_id() {
         let client = sign_test_client(sign_test_config(None));
         let url = Url::parse("https://example.com/api/vpn/list").unwrap();
         let err = client
-            .build_sign_header("GET", &url, b"")
+            .sign_request(&ApiName::ListVPN, "GET", &url, None, None, None, None)
             .expect_err("missing device_id must be an error");
         assert!(
             err.to_string().contains("device_id"),
@@ -2768,4 +3129,83 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connect_without_vpn_token_fails_before_sending() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client = test_client_for_server(port);
+        client.prepare_vpn_endpoint("127.0.0.1", port).unwrap();
+        let error = client
+            .request::<serde_json::Value>(
+                ApiName::ConnectVPN,
+                Some(vpn_connect_body("synthetic-public-key", "")),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("vpn-token cookie missing"));
+        assert!(timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn upstream_signer_matches_existing_android_fixtures() {
+        // Preserve the dev fixtures with synthetic credentials while sharing master's signer.
+        let mut conf = sign_test_config(Some("test-device-0123456789abcdef"));
+        conf.company_name = "example-corp".to_string();
+        let client = sign_test_client(conf);
+        let cookie = HeaderValue::from_static("session=test-session-b; csrf-token=test-csrf-token; vpn-token=test-vpn-token; device_id=test-device-0123456789abcdef; device_name=Android+Test");
+        let csrf = HeaderValue::from_static("test-csrf-token");
+        let jwt = HeaderValue::from_static("test-vpn-token");
+        let query = "os_version_patch=2021-01-05&os=Android&app_version=3.2.16&os_version=30&build_number=2008&model=Phone&language=en&client_source=FeiLian&brand=Genymotion";
+        let cases = [
+            (
+                ApiName::ListVPN,
+                "GET",
+                "/api/vpn/list",
+                "1700000101",
+                None,
+                "v1;CAEY/gMiIKfTp+9aO9kfIe+4+j//gFuHYic4kcaQkteHjH7Pi+py",
+            ),
+            (
+                ApiName::ConnectVPN,
+                "POST",
+                "/vpn/conn",
+                "1700000102",
+                Some(
+                    r#"{"mode":"Split","public_key":"test-public-key-1","otp":"000001","export_id":0,"not_auto":false}"#,
+                ),
+                "v1;CAEYngQiIIBY7RGBceJ9ROtDQvS7uYrw+pbWymmOAKMY+VTilFAa",
+            ),
+            (
+                ApiName::ConnectVPN,
+                "POST",
+                "/vpn/conn",
+                "1700000103",
+                Some(
+                    r#"{"mode":"Split","public_key":"test-public-key-2","otp":"000002","export_id":0,"not_auto":false}"#,
+                ),
+                "v1;CAEYngQiIEulXrVpNcI2v1ZGbesHWgsdkdmMhMNF/10IoVUlG3rk",
+            ),
+        ];
+        for (api, method, path, timestamp, body, expected) in cases {
+            let url = Url::parse(&format!(
+                "https://example.com{path}?{query}&timestamp={timestamp}"
+            ))
+            .unwrap();
+            let actual = client
+                .sign_request(
+                    &api,
+                    method,
+                    &url,
+                    body,
+                    Some(&cookie),
+                    Some(&csrf),
+                    Some(&jwt),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
 }
