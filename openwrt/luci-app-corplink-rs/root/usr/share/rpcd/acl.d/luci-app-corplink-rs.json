@@ -1,0 +1,11 @@
+{
+  "luci-app-corplink-rs": {
+    "description": "Manage the Corplink local SOCKS5 proxy and device login",
+    "read": {
+      "ubus": { "luci.corplink": ["status", "get_config", "logs", "login_status"] }
+    },
+    "write": {
+      "ubus": { "luci.corplink": ["save_config", "control", "login_begin", "login_submit", "login_cancel"] }
+    }
+  }
+}

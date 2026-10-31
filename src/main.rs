@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod dns;
 mod device_login;
+mod login_ui;
 mod qrcode;
 mod recovery;
 mod resp;
@@ -34,15 +35,18 @@ use recovery::RecoveryMonitor;
 const RECOVERY_REBUILD_NOT_BEFORE_ENV: &str = "CORPLINK_RECOVERY_REBUILD_NOT_BEFORE";
 
 fn print_usage_and_exit(name: &str, conf: &str) {
-    println!("usage:\n\t{} {}", name, conf);
+    print_version();
+    println!("usage:\n\t{name} {conf}\n\t{name} --login-only {conf}\n\t{name} --login-json {conf}");
     exit(1);
 }
 
-fn parse_arg() -> String {
+fn parse_arg() -> (String, bool, bool) {
     let mut conf_file = String::from("config.json");
     let mut args = env::args();
     // pop name
     let name = args.next().unwrap();
+    let mut login_only = false;
+    let mut json_events = false;
     match args.len() {
         0 => {}
         1 => {
@@ -57,11 +61,21 @@ fn parse_arg() -> String {
                 }
             }
         }
-        _ => {
-            print_usage_and_exit(&name, &conf_file);
+        2 => {
+            let flag = args.next().unwrap();
+            match flag.as_str() {
+                "--login-only" => login_only = true,
+                "--login-json" => {
+                    login_only = true;
+                    json_events = true;
+                }
+                _ => print_usage_and_exit(&name, &conf_file),
+            }
+            conf_file = args.next().unwrap();
         }
+        _ => print_usage_and_exit(&name, &conf_file),
     }
-    conf_file
+    (conf_file, login_only, json_events)
 }
 
 pub const EPERM: i32 = 1;
@@ -86,20 +100,23 @@ where
 
 #[tokio::main]
 async fn main() {
-    if let Err(err) = run().await {
+    // NOTE: If you want to debug, you should set `RUST_LOG` env to `debug` and run corplink-rs in root
+    //  because `check_privilege` will call sudo and drop env if you're not root
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let (conf_file, login_only, json_events) = parse_arg();
+    login_ui::enable(json_events);
+    if let Err(err) = run(conf_file, login_only).await {
+        login_ui::error("登录失败，请核对设备信息和授权步骤后重试");
         log::error!("{:#}", err);
         exit(EPERM);
     }
 }
 
-async fn run() -> Result<()> {
-    // NOTE: If you want to debug, you should set `RUST_LOG` env to `debug` and run corplink-rs in root
-    //  because `check_privilege` will call sudo and drop env if you're not root
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    print_version();
-
-    let conf_file = parse_arg();
+async fn run(conf_file: String, login_only: bool) -> Result<()> {
+    if !login_ui::enabled() {
+        print_version();
+    }
     let mut conf = Config::from_file(&conf_file)
         .await
         .context("failed to load config")?;
@@ -114,7 +131,7 @@ async fn run() -> Result<()> {
 
     // netstack/socks5 mode runs entirely in userspace (no kernel TUN device,
     // no system routes/dns), so it does not require elevated privileges.
-    if !netstack_mode {
+    if !netstack_mode && !login_only {
         check_privilege();
     }
 
@@ -154,7 +171,18 @@ async fn run() -> Result<()> {
         .server
         .clone()
         .context("server url missing after company discovery")?;
+    if login_only && conf.login_flow != Some(config::LoginFlow::Device) {
+        anyhow::bail!("login-only mode requires login_flow=device");
+    }
     let mut c = Client::new(conf).context("failed to initialize client")?;
+    // LuCI authentication must never allocate a VPN peer or start a tunnel.
+    if login_only {
+        if c.need_login() {
+            c.login().await.context("login failed")?;
+        }
+        login_ui::emit(serde_json::json!({"event": "done"}));
+        return Ok(());
+    }
     let mut logout_retry = true;
     let wg_conf: Option<WgConf>;
 

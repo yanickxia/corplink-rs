@@ -1,0 +1,76 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/corplink-rs-dev
+CONFIG_DIR=/etc/corplink-rs-dev
+CONFIG="$CONFIG_DIR/config.json"
+
+extra_command "login" "Log in interactively without starting a VPN connection"
+extra_command "check" "Check the proxy configuration and saved login session"
+
+check_config() {
+	[ -x "$PROG" ] && [ -r "$CONFIG" ] || {
+		echo "Missing executable or configuration: $PROG / $CONFIG" >&2
+		return 1
+	}
+
+	local routes dns listen
+	routes="$(jsonfilter -i "$CONFIG" -e '@.auto_setup_routes')" || return 1
+	dns="$(jsonfilter -i "$CONFIG" -e '@.use_vpn_dns')" || return 1
+	listen="$(jsonfilter -i "$CONFIG" -e '@.socks5_listen')" || return 1
+	[ "$routes" = false ] && [ "$dns" = false ] || {
+		echo "This service requires auto_setup_routes=false and use_vpn_dns=false." >&2
+		return 1
+	}
+	case "$listen" in
+		127.0.0.1:*) ;;
+		*) echo "This service requires a SOCKS5 listener on 127.0.0.1." >&2; return 1 ;;
+	esac
+}
+
+check() {
+	check_config || return 1
+	local state name
+	state="$(jsonfilter -i "$CONFIG" -e '@.state')" || return 1
+	name="$(jsonfilter -i "$CONFIG" -e '@.interface_name')" || return 1
+	[ "$state" = Login ] && [ -n "$name" ] && [ -s "$CONFIG_DIR/${name}_cookies.json" ] || {
+		echo "A separate device login is required. Run: service corplink-rs-dev login" >&2
+		return 1
+	}
+}
+
+login() {
+	check_config || return 1
+	[ -t 0 ] && [ -t 1 ] || {
+		echo "Use an interactive terminal: ssh -t n5100 'service corplink-rs-dev login'" >&2
+		return 1
+	}
+	if pidof corplink-rs-dev >/dev/null 2>&1; then
+		echo "Corplink is already running. Stop it before interactive login." >&2
+		return 1
+	fi
+	umask 077
+	cd "$CONFIG_DIR" || return 1
+	export RUST_LOG=info
+	exec "$PROG" --login-only "$CONFIG"
+}
+
+start_service() {
+	check || exit 1
+	if pidof corplink-rs-dev >/dev/null 2>&1 && ! service_running; then
+		echo "Corplink is running outside procd. Stop that process first." >&2
+		exit 1
+	fi
+	procd_open_instance
+	procd_set_param command /bin/sh -c 'umask 077; exec "$1" "$2"' corplink-rs-dev "$PROG" "$CONFIG"
+	procd_set_param env RUST_LOG=info
+	procd_set_param respawn 3600 60 3
+	procd_set_param term_timeout 30
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file "$CONFIG"
+	procd_close_instance
+}

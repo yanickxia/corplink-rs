@@ -108,7 +108,15 @@ pub fn mfa_body(kind: &str, code: Option<&str>) -> Map<String, Value> {
 
 pub fn read_input(prompt: &str) -> Result<String> {
     use std::io::{self, Write};
-    println!("{prompt}");
+    if crate::login_ui::enabled() {
+        crate::login_ui::emit(json!({
+            "event": "prompt",
+            "kind": if prompt.contains("回调") { "callback" } else { "code" },
+            "prompt": prompt,
+        }));
+    } else {
+        println!("{prompt}");
+    }
     io::stdout().flush()?;
     let mut line = String::new();
     if io::stdin().read_line(&mut line)? == 0 {
