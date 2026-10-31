@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!adapt-musl-go.sh
+!rustc-build-tools.sh
+!musl-go-init.c
+!source/
+!source/**

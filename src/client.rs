@@ -1111,17 +1111,29 @@ impl Client {
 
     async fn login_device(&mut self) -> Result<()> {
         let authorization = self.begin_device_login().await?;
-        println!(
-            "请在浏览器完成 {} 授权：\n{}",
-            authorization.method.alias, authorization.method.login_url
-        );
-        println!("授权完成后，如浏览器提示打开飞连，可取消该提示，复制地址栏的完整回调地址。");
-        device_login::open_browser(&authorization.method.login_url);
+        if crate::login_ui::enabled() {
+            crate::login_ui::emit(
+                json!({"event": "authorize", "url": authorization.method.login_url}),
+            );
+        } else {
+            println!(
+                "请在浏览器完成 {} 授权：\n{}",
+                authorization.method.alias, authorization.method.login_url
+            );
+            println!("授权完成后，如浏览器提示打开飞连，可取消该提示，复制地址栏的完整回调地址。");
+            device_login::open_browser(&authorization.method.login_url);
+        }
         let callback = loop {
             let input = device_login::read_input("请粘贴授权完成后的完整回调地址，然后按回车：")?;
             match authorization.callback_body(self.conf.server.as_deref().unwrap_or(""), &input) {
                 Ok(_) => break input,
-                Err(error) => eprintln!("{error}"),
+                Err(error) => {
+                    if crate::login_ui::enabled() {
+                        crate::login_ui::error(&error.to_string());
+                    } else {
+                        eprintln!("{error}");
+                    }
+                }
             }
         };
         let mut data = self
