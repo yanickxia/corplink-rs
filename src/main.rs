@@ -35,6 +35,7 @@ use recovery::RecoveryMonitor;
 const RECOVERY_REBUILD_NOT_BEFORE_ENV: &str = "CORPLINK_RECOVERY_REBUILD_NOT_BEFORE";
 
 fn print_usage_and_exit(name: &str, conf: &str) {
+    print_version();
     println!("usage:\n\t{name} {conf}\n\t{name} --login-only {conf}\n\t{name} --login-json {conf}");
     exit(1);
 }
@@ -99,6 +100,10 @@ where
 
 #[tokio::main]
 async fn main() {
+    // NOTE: If you want to debug, you should set `RUST_LOG` env to `debug` and run corplink-rs in root
+    //  because `check_privilege` will call sudo and drop env if you're not root
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let (conf_file, login_only, json_events) = parse_arg();
     login_ui::enable(json_events);
     if let Err(err) = run(conf_file, login_only).await {
@@ -109,10 +114,6 @@ async fn main() {
 }
 
 async fn run(conf_file: String, login_only: bool) -> Result<()> {
-    // NOTE: If you want to debug, you should set `RUST_LOG` env to `debug` and run corplink-rs in root
-    //  because `check_privilege` will call sudo and drop env if you're not root
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     if !login_ui::enabled() {
         print_version();
     }
